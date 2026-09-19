@@ -2,3 +2,6 @@
 __pycache__/
 instagram.session
 *.session
+
+.token.tmp
+_set_secrets.py
