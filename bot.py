@@ -285,6 +285,7 @@ def deliver_api_item(telegram, item, seen):
         if not paths:
             return False
         text = api_caption(owner, item)
+        print(f"→ {key}: {text[:120]!r}")
         for index, path in enumerate(paths):
             telegram.send_media(path, text if index == 0 else f"{owner} · اسلاید {index + 1}")
         seen.add(key)
