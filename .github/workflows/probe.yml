@@ -1,4 +1,4 @@
-name: probe-http2
+name: probe-api
 
 on:
   workflow_dispatch:
@@ -14,9 +14,9 @@ jobs:
         with:
           python-version: "3.12"
 
-      - run: pip install "httpx[http2]" requests
+      - run: pip install requests
 
-      - name: Compare HTTP/1.1 and HTTP/2 against Instagram
+      - name: Test Instagram private API endpoints
         env:
           IG_SESSION_B64: ${{ secrets.IG_SESSION_B64 }}
-        run: python -u probe_http2.py
+        run: python -u probe_api.py
