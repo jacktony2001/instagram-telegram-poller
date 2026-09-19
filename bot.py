@@ -45,10 +45,6 @@ RUN_DEADLINE = None
 ROUTE_DEADLINE = None
 
 
-class TooSlow(RateLimited):
-    """This route is too dead to be worth another second."""
-
-
 def set_run_deadline():
     global RUN_DEADLINE
     RUN_DEADLINE = time.monotonic() + RUN_BUDGET
@@ -76,6 +72,10 @@ def direct_session():
 
 class RateLimited(Exception):
     """Instagram throttled this address; another route may still work."""
+
+
+class TooSlow(RateLimited):
+    """This route is too dead to be worth another second."""
 
 
 class SessionDead(Exception):
