@@ -23,9 +23,11 @@ username = sys.argv[1]
 password = os.environ.get("IG_PASSWORD") or getpass.getpass(f"رمز {username}: ")
 
 loader = Instaloader()
-loader.login(username, password)
-if os.environ.get("IG_2FA_CODE"):
-    loader.two_factor_login(os.environ["IG_2FA_CODE"])
+try:
+    loader.login(username, password)
+except TwoFactorAuthRequiredException:
+    code = os.environ.get("IG_2FA_CODE") or input("کد شش‌رقمی تایید دومرحله‌ای: ")
+    loader.two_factor_login(code.strip())
 
 session_file = Path("instagram.session")
 loader.save_session_to_file(str(session_file))

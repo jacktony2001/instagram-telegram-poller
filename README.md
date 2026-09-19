@@ -11,33 +11,27 @@
 
 ## راه‌اندازی
 
-۱. در BotFather یک بات بساز و توکنش را بردار. بعد پیامی به بات بده تا `chat_id` خودت را پیدا کنی (مثلاً از `@userinfobot`).
+ریپو ساخته شده: `jacktony2001/instagram-telegram-poller` (خصوصی). برای بالا آمدن ربات فقط دو کار لازم است.
 
-۲. یک ریپوی **خصوصی** بساز و این فایل‌ها را داخلش بگذار.
+۱. در BotFather یک بات بساز و توکنش را بردار. بعد پیامی به بات بده تا `chat_id` خودت را پیدا کنی (مثلاً از `@userinfobot`). این دو را با نام‌های `TELEGRAM_BOT_TOKEN` و `TELEGRAM_CHAT_ID` در Settings → Secrets and variables → Actions ثبت کن.
 
-۳. با پایتون ۳.۱۲ یا جدیدتر، یک بار نشست بساز:
+۲. یک بار روی کامپیوتر خودت نشست اینستاگرام بساز:
+
+```bash
+.venv/Scripts/python make_session.py نام_کاربری_اینستاگرام      # ویندوز
+python3 make_session.py نام_کاربری_اینستاگرام                    # لینوکس و مک
+```
+
+رمز را می‌پرسد و موقع تایپ نشان نمی‌دهد. اگر تایید دومرحله‌ای داری، اول کد شش‌رقمی را در متغیر `IG_2FA_CODE` بگذار و بعد اجرا کن. در آخر یک رشته‌ی طولانی base64 چاپ می‌کند؛ آن را با نام `IG_SESSION_B64` ثبت کن و اسکرین‌نام را هم با نام `IG_USER`.
+
+اگر پایتون محیط پروژه را نداری، یک بار بسازش:
 
 ```bash
 python -m venv .venv
-.venv/Scripts/python -m pip install -r requirements.txt   # روی ویندوز
-# .venv/bin/python -m pip install -r requirements.txt     # روی لینوکس و مک
-.venv/Scripts/python make_session.py نام_کاربری_اکانت_دوم
+.venv/Scripts/python -m pip install -r requirements.txt
 ```
 
-اسکرین‌نام و رمز را می‌پرسد. اگر تایید دومرحله‌ای دارد، کد را هم می‌خواهد. در آخر یک رشته‌ی طولانی base64 چاپ می‌کند.
-
-۴. در تنظیمات ریپو، بخش Settings → Secrets and variables → Actions، این چهار مقدار را بساز:
-
-| نام | مقدار |
-|---|---|
-| `TELEGRAM_BOT_TOKEN` | توکن بات |
-| `TELEGRAM_CHAT_ID` | شناسه‌ی چت تو |
-| `IG_USER` | اسکرین‌نام اکانت دوم |
-| `IG_SESSION_B64` | آن رشته‌ی base64 از مرحله‌ی ۳ |
-
-۵. در `config.yaml` پیج‌های هدف را بنویس و push کن.
-
-۶. از تب Actions دکمه‌ی Run workflow را بزن تا یک بار دستی اجرا شود و نتیجه‌ی تلگرام را ببینی. بعد از آن خودکار هر ۱۵ دقیقه کار می‌کند.
+۳. در `config.yaml` پیج‌های هدف را بنویس و push کن. بعد از تب Actions یک بار Run workflow را بزن؛ از آن به بعد خودکار هر ۱۵ دقیقه اجرا می‌شود.
 
 ## نکته‌های مهم
 
