@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 from instaloader import Instaloader
+from instaloader.exceptions import TwoFactorAuthRequiredException
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
