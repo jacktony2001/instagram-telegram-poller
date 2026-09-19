@@ -355,18 +355,25 @@ def run_feed(loader, telegram, tracker, accounts):
 def run_profile(loader, telegram, tracker, accounts, want_stories):
     """Walk each account timeline and its stories, oldest-leftover aware."""
     delivered = 0
+    scanned = 0
+    blocked = None
     for username in accounts:
         check_time()
         try:
             profile = Profile.from_username(loader.context, username)
+            delivered += fetch_new_posts(loader, profile, telegram, tracker)
+            if want_stories:
+                delivered += fetch_new_stories(loader, profile, telegram, tracker)
+            scanned += 1
+        except RateLimited:
+            raise
         except Exception as exc:
             rethrow(exc)
+            blocked = exc
             print(f"اکانت {username} خطا: {exc}")
-            continue
-        delivered += fetch_new_posts(loader, profile, telegram, tracker)
-        if want_stories:
-            delivered += fetch_new_stories(loader, profile, telegram, tracker)
         tracker.save()
+    if scanned == 0 and blocked is not None:
+        raise RateLimited(blocked)
     return delivered
 
 
