@@ -1,4 +1,19 @@
 # هر پیجی که می‌خواهی دنبال کنی، بدون @ بنویس.
 accounts:
-  - nasa
+  - wwe
   - natgeo
+
+# feed = مستقیم از فیدِ خودِ اکانت خواننده (سریع‌ترین و کم‌ریسک‌ترین، ولی باید پیج‌ها را با آن اکانت فالو داشته باشی)
+# profile = تک‌تک پیج‌ها را جداگانه می‌خواند و استوری‌ها را هم می‌آورد
+# auto = اول feed، بعد profile تا استوری‌ها هم برسند
+mode: auto
+
+# استوری‌ها فقط از روش profile درمی‌آید؛ اگر نمی‌خواهی false بگذار.
+stories: true
+
+# چرخش پروکسی رایگان ProxyScrape وقتی اتصال مستقیم با ۴۲۹ رد می‌شود.
+proxies: true
+
+# اگر لیست پیش‌فرض از کار افتاد، آدرس لیست‌های دیگر را این‌جا بنویس (هر سطر ip:port).
+# proxy_urls:
+#   - https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/protocols/http/data.txt

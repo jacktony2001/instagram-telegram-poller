@@ -3,10 +3,12 @@
 import base64
 import json
 import os
+import random
 import shutil
 import sys
 import tempfile
 import time
+from functools import partial
 from pathlib import Path
 
 import requests
@@ -18,17 +20,56 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
 
-def read_cap():
-    raw = os.environ.get("MAX_NEW_PER_RUN", "").strip()
-    return int(raw) if raw.isdigit() and int(raw) > 0 else 10
-
-
-MAX_NEW_PER_RUN = read_cap()
 STATE_KEEP_POSTS = 400
 STATE_KEEP_STORIES = 600
 TELEGRAM_PHOTO_LIMIT = 10 * 1024 * 1024
 TELEGRAM_VIDEO_LIMIT = 50 * 1024 * 1024
 MEDIA_SUFFIXES = {".jpg", ".jpeg", ".png", ".mp4"}
+PROXY_LIST_URLS = [
+    "https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/protocols/http/data.txt",
+    "https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/protocols/https/data.txt",
+]
+
+
+def read_int_env(name, default):
+    raw = os.environ.get(name, "").strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else default
+
+
+MAX_NEW_PER_RUN = read_int_env("MAX_NEW_PER_RUN", 10)
+PROXY_TRIES = read_int_env("PROXY_TRIES", 15)
+
+
+def direct_session():
+    """A session that ignores proxy env vars, for Telegram and GitHub calls."""
+    session = requests.Session()
+    session.trust_env = False
+    return session
+
+
+class RateLimited(Exception):
+    """Instagram throttled this address; another route may still work."""
+
+
+class SessionDead(Exception):
+    """Instagram wants a human again; no proxy fixes this."""
+
+
+def classify(exc):
+    text = f"{type(exc).__name__}: {exc}".lower()
+    if "checkpoint" in text or "feedback required" in text or "login" in text:
+        return "dead"
+    if "429" in text or "too many requests" in text:
+        return "rate"
+    return None
+
+
+def rethrow(exc):
+    kind = classify(exc)
+    if kind == "dead":
+        raise SessionDead(exc) from exc
+    if kind == "rate":
+        raise RateLimited(exc) from exc
 
 
 def load_config(path):
@@ -37,7 +78,17 @@ def load_config(path):
     accounts = [str(a).strip().lstrip("@") for a in data.get("accounts", [])]
     if not accounts:
         sys.exit("config.yaml: هیچ اکانتی در لیست accounts تعریف نشده است.")
-    return accounts
+    mode = str(data.get("mode", "auto")).strip().lower()
+    if mode not in {"auto", "feed", "profile"}:
+        sys.exit("config.yaml: مقدار mode باید auto یا feed یا profile باشد.")
+    urls = [str(u).strip() for u in data.get("proxy_urls", []) if str(u).strip()]
+    return {
+        "accounts": accounts,
+        "mode": mode,
+        "stories": bool(data.get("stories", True)),
+        "proxies": bool(data.get("proxies", True)),
+        "proxy_urls": urls or PROXY_LIST_URLS,
+    }
 
 
 def load_state(path):
@@ -65,6 +116,7 @@ def build_loader():
         dirname_pattern="{target}",
         filename_pattern="{date:%Y%m%d}_{shortcode}{_num}.{ext}",
         request_timeout=60.0,
+        fatal_status_codes=[429],
         quiet=True,
     )
 
@@ -91,13 +143,14 @@ class Telegram:
     def __init__(self, token, chat_id):
         self.base = f"https://api.telegram.org/bot{token}"
         self.chat_id = chat_id
+        self.session = direct_session()
 
     def _post(self, method, payload, files=None):
-        resp = requests.post(f"{self.base}/{method}", data=payload, files=files, timeout=120)
+        url = f"{self.base}/{method}"
+        resp = self.session.post(url, data=payload, files=files, timeout=120)
         if resp.status_code == 429:
-            retry = resp.json().get("parameters", {}).get("retry_after", 5)
-            time.sleep(retry)
-            resp = requests.post(f"{self.base}/{method}", data=payload, files=files, timeout=120)
+            time.sleep(resp.json().get("parameters", {}).get("retry_after", 5))
+            resp = self.session.post(url, data=payload, files=files, timeout=120)
         if not resp.ok:
             print(f"تلگرام {method} خطا: {resp.text[:300]}")
         return resp.json().get("ok")
@@ -118,76 +171,6 @@ class Telegram:
 
     def notify(self, text):
         return self._post("sendMessage", {"chat_id": self.chat_id, "text": text[:4096]})
-
-
-def caption_for(post):
-    lines = [f"{post.owner_profile.username} · {post.date_utc:%Y-%m-%d %H:%M}"]
-    if post.caption:
-        lines.append(post.caption.strip())
-    lines.append(post.url)
-    return "\n".join(lines)
-
-
-def collect_files(directory):
-    return sorted(p for p in Path(directory).rglob("*") if p.suffix.lower() in MEDIA_SUFFIXES)
-
-
-def fetch_new_posts(loader, profile, seen_posts, telegram, draining=False):
-    """Return (delivered, still_draining).
-
-    Posts arrive newest-first, so a seen shortcode normally ends the scan. After a
-    run that hit MAX_NEW_PER_RUN the older leftovers must still be drained.
-    """
-    delivered = 0
-    for post in profile.get_posts():
-        if post.shortcode in seen_posts:
-            if not draining:
-                break
-            continue
-        if delivered >= MAX_NEW_PER_RUN:
-            return delivered, True
-        seen_posts.add(post.shortcode)
-        tmp = tempfile.mkdtemp()
-        try:
-            if loader.download_post(post, target=tmp):
-                files = collect_files(tmp)
-                text = caption_for(post)
-                for index, path in enumerate(files):
-                    telegram.send_media(path, text if index == 0 else f"{post.owner_profile.username} · اسلاید {index + 1}")
-                delivered += 1
-            else:
-                print(f"دانلود پست {post.shortcode} ناموفق بود")
-        except Exception as exc:
-            print(f"پست {post.shortcode} خطا: {exc}")
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
-    return delivered, False
-
-
-def fetch_new_stories(loader, profile, seen_stories, telegram):
-    delivered = 0
-    story = next(iter(loader.get_stories([profile.userid])), None)
-    if story is None:
-        return 0
-    for item in story.get_items():
-        if item.mediaid in seen_stories:
-            continue
-        if delivered >= MAX_NEW_PER_RUN:
-            print(f"استوری‌های بیشترِ {profile.username} به اجرای بعدی می‌ماند.")
-            break
-        seen_stories.add(item.mediaid)
-        tmp = tempfile.mkdtemp()
-        try:
-            loader.download_storyitem(item, target=tmp)
-            for index, path in enumerate(collect_files(tmp)):
-                text = f"{profile.username} · استوری · {item.date_local:%H:%M}"
-                telegram.send_media(path, text if index == 0 else f"{profile.username} · استوری {index + 1}")
-                delivered += 1
-        except Exception as exc:
-            print(f"استوری {item.mediaid} خطا: {exc}")
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
-    return delivered
 
 
 class Seen:
@@ -211,36 +194,297 @@ class Seen:
         return self.order
 
 
+class Tracker:
+    """One Seen list per account, mirrored into the state dict and onto disk."""
+
+    def __init__(self, state):
+        self.state = state
+        self._posts = {}
+        self._stories = {}
+
+    def _entry(self, account):
+        return self.state.setdefault(account, {"posts": [], "stories": [], "draining": False})
+
+    def _seen(self, account, bucket, keep, cache):
+        if account not in cache:
+            cache[account] = Seen(self._entry(account)[bucket], keep)
+        return cache[account]
+
+    def posts(self, account):
+        return self._seen(account, "posts", STATE_KEEP_POSTS, self._posts)
+
+    def stories(self, account):
+        return self._seen(account, "stories", STATE_KEEP_STORIES, self._stories)
+
+    def draining(self, account):
+        return bool(self._entry(account).get("draining"))
+
+    def set_draining(self, account, value):
+        self._entry(account)["draining"] = bool(value)
+
+    def save(self):
+        for account, seen in self._posts.items():
+            self._entry(account)["posts"] = seen.as_list()
+        for account, seen in self._stories.items():
+            self._entry(account)["stories"] = seen.as_list()
+        save_state("state.json", self.state)
+
+
+class ProxyPool:
+    """Free proxy lists from ProxyScrape, shuffled so each attempt takes a different route."""
+
+    def __init__(self, urls):
+        self.session = direct_session()
+        found = []
+        seen = set()
+        for url in urls:
+            try:
+                resp = self.session.get(url, timeout=30)
+                resp.raise_for_status()
+            except Exception as exc:
+                print(f"لیست پروکسی گرفته نشد ({url}): {exc}")
+                continue
+            for line in resp.text.splitlines():
+                proxy = line.strip()
+                if proxy.count(":") >= 2 and proxy not in seen:
+                    seen.add(proxy)
+                    found.append(proxy)
+        random.shuffle(found)
+        self.queue = found[:PROXY_TRIES]
+        print(f"{len(self.queue)} پروکسی برای آزمایش آماده است.")
+
+    def routes(self):
+        """The direct address first, then every proxy."""
+        return [None] + self.queue
+
+
+def apply_proxy(proxy):
+    """instaloader only ever uses requests sessions, which re-read these vars per request."""
+    for key in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+        os.environ.pop(key, None)
+    if proxy:
+        for key in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+            os.environ[key] = proxy
+
+
+def caption_for(post):
+    lines = [f"{post.owner_profile.username} · {post.date_utc:%Y-%m-%d %H:%M}"]
+    if post.caption:
+        lines.append(post.caption.strip())
+    lines.append(post.url)
+    return "\n".join(lines)
+
+
+def collect_files(directory):
+    return sorted(p for p in Path(directory).rglob("*") if p.suffix.lower() in MEDIA_SUFFIXES)
+
+
+def deliver_post(loader, post, telegram, seen_posts):
+    """Download one post and upload every slide. Returns False when nothing came through."""
+    tmp = tempfile.mkdtemp()
+    try:
+        try:
+            downloaded = loader.download_post(post, target=tmp)
+        except Exception as exc:
+            rethrow(exc)
+            print(f"پست {post.shortcode} خطا: {exc}")
+            return False
+        if not downloaded:
+            print(f"دانلود پست {post.shortcode} ناموفق بود")
+            return False
+        files = collect_files(tmp)
+        owner = post.owner_profile.username
+        text = caption_for(post)
+        for index, path in enumerate(files):
+            telegram.send_media(path, text if index == 0 else f"{owner} · اسلاید {index + 1}")
+        seen_posts.add(post.shortcode)
+        return True
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def run_feed(loader, telegram, tracker, accounts):
+    """Take what Instagram already pushes into the logged-in account's own feed.
+
+    This needs no per-profile request at all, so it survives pages being closed off,
+    but the reading account must follow every target itself.
+    """
+    wanted = set(accounts)
+    delivered = 0
+    for post in loader.get_feed_posts():
+        owner = post.owner_profile.username
+        if owner not in wanted or post.shortcode in tracker.posts(owner):
+            continue
+        if delivered >= MAX_NEW_PER_RUN:
+            break
+        if deliver_post(loader, post, telegram, tracker.posts(owner)):
+            delivered += 1
+            tracker.save()
+    return delivered
+
+
+def run_profile(loader, telegram, tracker, accounts, want_stories):
+    """Walk each account timeline and its stories, oldest-leftover aware."""
+    delivered = 0
+    for username in accounts:
+        try:
+            profile = Profile.from_username(loader.context, username)
+        except Exception as exc:
+            rethrow(exc)
+            print(f"اکانت {username} خطا: {exc}")
+            continue
+        delivered += fetch_new_posts(loader, profile, telegram, tracker)
+        if want_stories:
+            delivered += fetch_new_stories(loader, profile, telegram, tracker)
+        tracker.save()
+    return delivered
+
+
+def fetch_new_posts(loader, profile, telegram, tracker):
+    """Return how many posts went out, leaving the draining flag set if leftovers remain."""
+    username = profile.username
+    seen_posts = tracker.posts(username)
+    draining = tracker.draining(username)
+    delivered = 0
+    for post in profile.get_posts():
+        if post.shortcode in seen_posts:
+            if not draining:
+                break
+            continue
+        if delivered >= MAX_NEW_PER_RUN:
+            tracker.set_draining(username, True)
+            return delivered
+        if deliver_post(loader, post, telegram, seen_posts):
+            delivered += 1
+            tracker.save()
+    tracker.set_draining(username, False)
+    return delivered
+
+
+def fetch_new_stories(loader, profile, telegram, tracker):
+    username = profile.username
+    seen_stories = tracker.stories(username)
+    delivered = 0
+    story = next(iter(loader.get_stories([profile.userid])), None)
+    if story is None:
+        return 0
+    for item in story.get_items():
+        if item.mediaid in seen_stories:
+            continue
+        if delivered >= MAX_NEW_PER_RUN:
+            print(f"استوری‌های بیشترِ {username} به اجرای بعدی می‌ماند.")
+            break
+        tmp = tempfile.mkdtemp()
+        try:
+            try:
+                loader.download_storyitem(item, target=tmp)
+            except Exception as exc:
+                rethrow(exc)
+                print(f"استوری {item.mediaid} خطا: {exc}")
+                continue
+            for index, path in enumerate(collect_files(tmp)):
+                text = f"{username} · استوری · {item.date_local:%H:%M}"
+                telegram.send_media(path, text if index == 0 else f"{username} · استوری {index + 1}")
+                delivered += 1
+            seen_stories.add(item.mediaid)
+            tracker.save()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    return delivered
+
+
+def disable_workflow():
+    """Turn the scheduler off through the GitHub API, because the runner cannot do it itself."""
+    token = os.environ.get("ACTIONS_TOKEN", "").strip()
+    repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
+    workflow = os.environ.get("WORKFLOW_FILE", "poll.yml").strip()
+    if not token or not repo:
+        print("برای خاموش کردن workflow متغیرهای ACTIONS_TOKEN و GITHUB_REPOSITORY لازم‌اند.")
+        return False
+    resp = direct_session().put(
+        f"https://api.github.com/repos/{repo}/actions/workflows/{workflow}/disable",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        timeout=30,
+    )
+    print(f"خاموش کردن workflow: کد {resp.status_code}")
+    return resp.ok
+
+
+def try_strategy(strategy, loader, telegram, tracker, accounts, routes):
+    """Run a strategy over each route, rotating proxies whenever Instagram answers 429."""
+    last = None
+    for proxy in routes:
+        apply_proxy(proxy)
+        route = "اتصال مستقیم" if proxy is None else f"پروکسی {proxy}"
+        print(f"امتحان با {route} …")
+        try:
+            count = strategy(loader, telegram, tracker, accounts)
+            print(f"{route} جواب داد: {count} آیتم تازه.")
+            return count
+        except SessionDead:
+            raise
+        except RateLimited as exc:
+            last = exc
+            print(f"{route} با ۴۲۹ محدود شد.")
+        except Exception as exc:
+            last = last or exc
+            print(f"{route} بی‌نتیجه ماند: {exc}")
+    raise RateLimited(last or "هیچ روشی کار نکرد")
+
+
 def main():
     missing = [k for k in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID") if not os.environ.get(k)]
     if missing:
         sys.exit(f"متغیرهای زیر تنظیم نشده‌اند: {', '.join(missing)}")
-    accounts = load_config(os.environ.get("CONFIG", "config.yaml"))
+    config = load_config(os.environ.get("CONFIG", "config.yaml"))
     state = load_state("state.json")
+    tracker = Tracker(state)
     telegram = Telegram(os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_CHAT_ID"])
     loader = build_loader()
 
-    totals = {"posts": 0, "stories": 0}
-    for username in accounts:
-        account = state.setdefault(username, {"posts": [], "stories": []})
-        seen_posts = Seen(account["posts"], STATE_KEEP_POSTS)
-        seen_stories = Seen(account["stories"], STATE_KEEP_STORIES)
-        try:
-            profile = Profile.from_username(loader.context, username)
-            delivered, account["draining"] = fetch_new_posts(
-                loader, profile, seen_posts, telegram, account.get("draining", False)
-            )
-            totals["posts"] += delivered
-            totals["stories"] += fetch_new_stories(loader, profile, seen_stories, telegram)
-        except Exception as exc:
-            print(f"اکانت {username} خطا: {exc}")
-            continue
-        account["posts"], account["stories"] = seen_posts.as_list(), seen_stories.as_list()
+    routes = ProxyPool(config["proxy_urls"]).routes() if config["proxies"] else [None]
+    strategies = {"feed": run_feed, "profile": partial(run_profile, want_stories=config["stories"])}
+    order = ["feed", "profile"] if config["mode"] == "auto" else [config["mode"]]
 
-    save_state("state.json", state)
-    print(f"جدید: {totals['posts']} پست، {totals['stories']} استوری")
-    if totals["posts"] or totals["stories"]:
-        telegram.notify(f"✅ {totals['posts']} پست و {totals['stories']} استوری تازه ارسال شد.")
+    delivered = 0
+    for name in order:
+        try:
+            delivered += try_strategy(strategies[name], loader, telegram, tracker, config["accounts"], routes)
+            if name == "feed" and config["stories"] and config["mode"] == "auto":
+                print("استوری‌ها فقط از روش profile درمی‌آید؛ آن هم امتحان می‌شود.")
+                try:
+                    delivered += try_strategy(
+                        strategies["profile"], loader, telegram, tracker, config["accounts"], routes
+                    )
+                except (RateLimited, SessionDead) as exc:
+                    print(f"روش profile نشد: {exc}")
+            break
+        except SessionDead as exc:
+            print(f"نشست اینستاگرام از کار افتاده: {exc}")
+            telegram.notify(
+                "⛔ اینستاگرام نشست را بازرسی خواسته؛ پروکسی فایده ندارد. "
+                "یک نشست تازه بسازید و IG_SESSION_B64 را عوض کنید. ربات خودکار خاموش شد."
+            )
+            disable_workflow()
+            tracker.save()
+            sys.exit(1)
+        except RateLimited as exc:
+            print(f"روش {name} محدود شد: {exc}")
+            if name == order[-1]:
+                telegram.notify(
+                    "⛔ هم اتصال مستقیم و هم پروکسی‌ها با محدودیت ۴۲۹ اینستاگرام رد شدند. "
+                    "workflow خودکار خاموش می‌شود؛ برای روشن کردن دوباره به Actions بروید."
+                )
+                disable_workflow()
+
+    tracker.save()
+    print(f"جدید: {delivered} آیتم فرستاده شد")
+    if delivered:
+        telegram.notify(f"✅ {delivered} آیتم تازه از اینستاگرام ارسال شد.")
 
 
 if __name__ == "__main__":
