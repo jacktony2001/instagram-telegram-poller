@@ -1,8 +1,9 @@
-"""Find which private-API endpoints still answer from the GitHub runner."""
+"""Map which private-API routes answer from the runner, using the working feed/timeline."""
 
 import base64
 import os
 import pickle
+import random
 import sys
 
 import requests
@@ -10,6 +11,7 @@ import requests
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
+API = "https://i.instagram.com/api/v1"
 HEADERS = {
     "X-IG-App-ID": "936619743392459",
     "Accept": "*/*",
@@ -21,18 +23,11 @@ HEADERS = {
         "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
     ),
 }
-API = "https://i.instagram.com/api/v1"
 
 
 def load_cookies():
-    """instaloader pickles a plain name-to-value cookie dict."""
     data = pickle.loads(base64.b64decode(os.environ["IG_SESSION_B64"].strip()))
     return {k: str(v) for k, v in data.items()}
-
-
-def show(name, resp):
-    body = " ".join(resp.text.split())[:180]
-    print(f"{name}: HTTP {resp.status_code} · {body}")
 
 
 def main():
@@ -42,38 +37,52 @@ def main():
     session.headers.update(HEADERS)
     session.cookies.update(load_cookies())
 
-    def get(name, url, params=None):
+    def get(name, url, params=None, bare=False):
         try:
-            resp = session.get(url, params=params, timeout=30)
+            resp = session.get(url, params=params, timeout=30) if not bare else requests.get(url, timeout=30)
         except Exception as exc:
             print(f"{name}: خطا {type(exc).__name__}: {exc}")
             return None
-        show(name, resp)
+        print(f"{name}: HTTP {resp.status_code} · {' '.join(resp.text.split())[:120]}")
         return resp
 
-    me = get("own account", f"{API}/users/{session.cookies.get('ds_user_id')}/info/")
-    if me is None or not me.ok:
-        print("نشست به API خصوصی دسترسی ندارد؛ همین‌جا می‌بندیم.")
+    rank_token = f"{random.randint(10**9, 10**10 - 1)},{random.randint(10**9, 10**10 - 1)}"
+    first = get("feed/timeline", f"{API}/feed/timeline/", {"rank_token": rank_token, "media_id": ""})
+    try:
+        data = first.json()
+    except Exception:
+        print("پاسخ فید JSON نبود؛ همین‌جا می‌بندیم.")
         return
 
-    for name in os.environ.get("TARGETS", "wwe,natgeo").split(","):
-        username = name.strip()
-        if not username:
-            continue
-        info = get(f"usernameinfo {username}", f"{API}/users/usernameinfo/", {"username": username})
-        try:
-            pk = info.json()["user"]["pk"]
-        except Exception:
-            continue
-        get(f"timeline {username}", f"{API}/feed/user/{pk}/", {"count": 12, "max_id": ""})
-        get(f"reels {username}", f"{API}/feed/reels_media/", {"reel_pk_ids": pk})
-        clips = get(f"clips {username}", f"{API}/feed/user/{pk}/reel_media/")
-        try:
-            item = clips.json()["items"][0]
-            candidate = item["image_versions2"]["candidates"][0]["url"]
-            get("cdn media", candidate)
-        except Exception:
-            pass
+    media = [entry["media_or_ad"] for entry in data.get("feed_items", []) if "media_or_ad" in entry]
+    owners = sorted({m["user"]["username"] for m in media if m.get("user")})
+    print(f"آیتم‌های فید: {len(media)} · کاربران: {', '.join(owners) or 'هیچ'}")
+    print(f"next_max_id: {data.get('next_max_id')} · أكثر آیتم: {data.get('more_available')}")
+    if not media:
+        return
+
+    sample = media[0]
+    user = sample["user"]
+    pk = user["pk"]
+    username = user["username"]
+    print(f"نمونه: {username} · pk={pk} · نوع={sample.get('media_type')} · code={sample.get('code')}")
+
+    page = data.get("next_max_id")
+    if page:
+        get("feed/timeline page2", f"{API}/feed/timeline/", {"rank_token": rank_token, "max_id": page})
+
+    get(f"feed/user/{username}", f"{API}/feed/user/{pk}/", {"count": 12})
+    get(f"clips/{username}", f"{API}/feed/user/{pk}/reel_media/")
+    get(f"reels_media/{username}", f"{API}/feed/reels_media/", {"reel_ids": pk})
+    get("reels_tray", f"{API}/feed/reels_tray/", {"reason": "pull_to_refresh"})
+    get(f"info/{username}", f"{API}/users/{pk}/info/")
+
+    candidates = (sample.get("image_versions2") or {}).get("candidates") or []
+    if candidates:
+        get("cdn image (بدون کوکی)", candidates[0]["url"], bare=True)
+    videos = sample.get("video_versions") or []
+    if videos:
+        get("cdn video (بدون کوکی)", videos[0]["url"], bare=True)
 
 
 if __name__ == "__main__":
