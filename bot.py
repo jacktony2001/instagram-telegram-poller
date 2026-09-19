@@ -117,6 +117,7 @@ def load_config(path):
         "stories": bool(data.get("stories", True)),
         "proxies": bool(data.get("proxies", True)),
         "proxy_urls": urls or PROXY_LIST_URLS,
+        "max_post_age_hours": int(data.get("max_post_age_hours", 24) or 24),
     }
 
 
@@ -264,7 +265,7 @@ def api_caption(owner, item):
     return "\n".join(lines)
 
 
-def deliver_api_item(telegram, item, seen):
+def deliver_api_item(telegram, item, seen, album=True):
     """Download one private-API item from the CDN and upload it. Returns False if nothing arrived."""
     owner = (item.get("user") or {}).get("username") or "?"
     key = str(item.get("code") or item.get("pk"))
@@ -286,29 +287,56 @@ def deliver_api_item(telegram, item, seen):
             return False
         text = api_caption(owner, item)
         print(f"→ {key}: {text[:120]!r}")
-        for index, path in enumerate(paths):
-            telegram.send_media(path, text if index == 0 else f"{owner} · اسلاید {index + 1}")
+        # Telegram caps an album at 10 files, so a longer carousel is split into follow-up albums.
+        chunks = [paths[i : i + 10] for i in range(0, len(paths), 10)] if album else [[p] for p in paths]
+        sent_ok = True
+        for number, chunk in enumerate(chunks, start=1):
+            head = text if number == 1 else f"{owner} · ادامه، بخش {number}"
+            if len(chunk) > 1:
+                result = telegram.send_album(chunk, head)
+            else:
+                result = telegram.send_media(chunk[0], head)
+            sent_ok = sent_ok and bool(result)
+        if not sent_ok:
+            # Leave it unseen so the next run retries it instead of losing the post.
+            return False
         seen.add(key)
         return True
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def run_api(api, telegram, tracker, accounts):
+def run_api(api, telegram, tracker, accounts, fresh_hours=24):
     """Follow the accounts through the feed and their story reels, without instaloader."""
     wanted = set(accounts)
-    delivered = 0
+    horizon = time.time() - fresh_hours * 3600
+    candidates, stale = [], 0
     for item in api.feed():
         check_time()
         user = item.get("user") or {}
-        if user.get("username") not in wanted:
+        account = user.get("username")
+        if account not in wanted:
             continue
-        tracker.set_pk(user["username"], user.get("pk"))
-        if str(item.get("code")) in tracker.posts(user["username"]):
+        tracker.set_pk(account, user.get("pk"))
+        if str(item.get("code")) in tracker.posts(account):
             continue
-        if delivered >= MAX_NEW_PER_RUN:
-            break
-        if deliver_api_item(telegram, item, tracker.posts(user["username"])):
+        # The home feed is ranked, not chronological, so it hands us month-old posts too.
+        if (item.get("taken_at") or 0) < horizon:
+            stale += 1
+            continue
+        candidates.append(item)
+    if stale:
+        print(f"{stale} آیتم قدیمی‌تر از {fresh_hours} ساعت رد شد.")
+
+    # Take the newest ones, then send them oldest-first so the chat reads in order.
+    candidates.sort(key=lambda item: item.get("taken_at") or 0, reverse=True)
+    batch = candidates[:MAX_NEW_PER_RUN]
+    if len(candidates) > len(batch):
+        print(f"{len(candidates) - len(batch)} آیتم برای اجرای بعدی می‌ماند.")
+    delivered = 0
+    for item in sorted(batch, key=lambda item: item.get("taken_at") or 0):
+        account = (item.get("user") or {}).get("username")
+        if deliver_api_item(telegram, item, tracker.posts(account)):
             delivered += 1
             tracker.save()
 
@@ -318,14 +346,14 @@ def run_api(api, telegram, tracker, accounts):
             continue
         reel = api.reel(pk)
         seen_stories = tracker.stories(account)
-        for story in (reel or {}).get("items") or []:
+        pending = [s for s in (reel or {}).get("items") or [] if str(s.get("pk")) not in seen_stories]
+        pending.sort(key=lambda story: story.get("taken_at") or 0)
+        for story in pending:
             check_time()
-            if str(story.get("pk")) in seen_stories:
-                continue
             if delivered >= MAX_NEW_PER_RUN:
                 print(f"استوری‌های بیشترِ {account} به اجرای بعدی می‌ماند.")
                 break
-            if deliver_api_item(telegram, story, seen_stories):
+            if deliver_api_item(telegram, story, seen_stories, album=False):
                 delivered += 1
                 tracker.save()
     return delivered
@@ -347,19 +375,37 @@ class Telegram:
             print(f"تلگرام {method} خطا: {resp.text[:300]}")
         return resp.json().get("ok")
 
-    def send_media(self, path, caption):
+    def _kind(self, path):
         suffix = path.suffix.lower()
         size = path.stat().st_size
         if suffix in {".jpg", ".jpeg", ".png"}:
-            method = "sendPhoto" if size <= TELEGRAM_PHOTO_LIMIT else "sendDocument"
-        else:
-            method = "sendVideo" if size <= TELEGRAM_VIDEO_LIMIT else "sendDocument"
+            return "photo" if size <= TELEGRAM_PHOTO_LIMIT else "document"
+        return "video" if size <= TELEGRAM_VIDEO_LIMIT else "document"
+
+    def send_media(self, path, caption):
+        method = "send" + self._kind(path).capitalize()
+        field = method.removeprefix("send").lower() or "photo"
         with open(path, "rb") as fh:
             return self._post(
                 method,
                 {"chat_id": self.chat_id, "caption": caption[:1024]},
-                {method.removeprefix("send").lower() or "photo": fh},
+                {field: fh},
             )
+
+    def send_album(self, paths, caption):
+        """One Instagram post as one Telegram album; the caption sits on the first slide."""
+        media, handles = [], {}
+        for index, path in enumerate(paths):
+            entry = {"type": self._kind(path), "media": f"attach://file{index}"}
+            if index == 0:
+                entry["caption"] = caption[:1024]
+            media.append(entry)
+            handles[f"file{index}"] = open(path, "rb")
+        try:
+            return self._post("sendMediaGroup", {"chat_id": self.chat_id, "media": json.dumps(media)}, handles)
+        finally:
+            for fh in handles.values():
+                fh.close()
 
     def notify(self, text):
         return self._post("sendMessage", {"chat_id": self.chat_id, "text": text[:4096]})
@@ -662,7 +708,11 @@ def main():
 
     routes = ProxyPool(config["proxy_urls"]).routes() if config["proxies"] else [None]
     clients = {"api": IGApi(load_session_cookies()), "loader": loader}
-    strategies = {"api": run_api, "feed": run_feed, "profile": partial(run_profile, want_stories=config["stories"])}
+    strategies = {
+        "api": partial(run_api, fresh_hours=config["max_post_age_hours"]),
+        "feed": run_feed,
+        "profile": partial(run_profile, want_stories=config["stories"]),
+    }
     order = ["api", "profile"] if config["mode"] == "auto" else [config["mode"]]
 
     delivered = 0
