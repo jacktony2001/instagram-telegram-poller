@@ -1,0 +1,42 @@
+name: poll-instagram
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: poll-instagram
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Send new media to Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          IG_SESSION_B64: ${{ secrets.IG_SESSION_B64 }}
+          IG_USER: ${{ secrets.IG_USER }}
+        run: python bot.py
+
+      - name: Commit seen-media state
+        run: |
+          git config user.name "instagram-poller[bot]"
+          git config user.email "bot@users.noreply.github.com"
+          git add state.json
+          git diff --cached --quiet || git commit -m "state: $(date -u +%FT%TZ)"
+          git push
