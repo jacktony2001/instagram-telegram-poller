@@ -37,7 +37,34 @@ def read_int_env(name, default):
 
 
 MAX_NEW_PER_RUN = read_int_env("MAX_NEW_PER_RUN", 10)
-PROXY_TRIES = read_int_env("PROXY_TRIES", 15)
+PROXY_TRIES = read_int_env("PROXY_TRIES", 8)
+RUN_BUDGET = read_int_env("RUN_BUDGET", 600)
+ROUTE_BUDGET = read_int_env("ROUTE_BUDGET", 150)
+
+RUN_DEADLINE = None
+ROUTE_DEADLINE = None
+
+
+class TooSlow(RateLimited):
+    """This route is too dead to be worth another second."""
+
+
+def set_run_deadline():
+    global RUN_DEADLINE
+    RUN_DEADLINE = time.monotonic() + RUN_BUDGET
+
+
+def set_route_deadline():
+    global ROUTE_DEADLINE
+    ROUTE_DEADLINE = min(time.monotonic() + ROUTE_BUDGET, RUN_DEADLINE)
+
+
+def check_time():
+    """Raise out of a scan when the job would otherwise be killed by the runner."""
+    if time.monotonic() > ROUTE_DEADLINE:
+        raise TooSlow("وقت این روش تمام شد")
+    if time.monotonic() > RUN_DEADLINE:
+        raise RateLimited("وقت کل job تمام شد")
 
 
 def direct_session():
@@ -115,7 +142,8 @@ def build_loader():
         storyitem_metadata_txt_pattern="",
         dirname_pattern="{target}",
         filename_pattern="{date:%Y%m%d}_{shortcode}{_num}.{ext}",
-        request_timeout=60.0,
+        request_timeout=20.0,
+        max_connection_attempts=2,
         fatal_status_codes=[429],
         quiet=True,
     )
@@ -312,6 +340,7 @@ def run_feed(loader, telegram, tracker, accounts):
     wanted = set(accounts)
     delivered = 0
     for post in loader.get_feed_posts():
+        check_time()
         owner = post.owner_profile.username
         if owner not in wanted or post.shortcode in tracker.posts(owner):
             continue
@@ -327,6 +356,7 @@ def run_profile(loader, telegram, tracker, accounts, want_stories):
     """Walk each account timeline and its stories, oldest-leftover aware."""
     delivered = 0
     for username in accounts:
+        check_time()
         try:
             profile = Profile.from_username(loader.context, username)
         except Exception as exc:
@@ -347,6 +377,7 @@ def fetch_new_posts(loader, profile, telegram, tracker):
     draining = tracker.draining(username)
     delivered = 0
     for post in profile.get_posts():
+        check_time()
         if post.shortcode in seen_posts:
             if not draining:
                 break
@@ -369,6 +400,7 @@ def fetch_new_stories(loader, profile, telegram, tracker):
     if story is None:
         return 0
     for item in story.get_items():
+        check_time()
         if item.mediaid in seen_stories:
             continue
         if delivered >= MAX_NEW_PER_RUN:
@@ -415,10 +447,13 @@ def disable_workflow():
 
 
 def try_strategy(strategy, loader, telegram, tracker, accounts, routes):
-    """Run a strategy over each route, rotating proxies whenever Instagram answers 429."""
-    last = None
+    """Run a strategy over each route, rotating proxies whenever a route is blocked or dead."""
+    blocked = None
     for proxy in routes:
+        if time.monotonic() > RUN_DEADLINE:
+            raise RateLimited(blocked or "وقت کل job تمام شد")
         apply_proxy(proxy)
+        set_route_deadline()
         route = "اتصال مستقیم" if proxy is None else f"پروکسی {proxy}"
         print(f"امتحان با {route} …")
         try:
@@ -428,18 +463,19 @@ def try_strategy(strategy, loader, telegram, tracker, accounts, routes):
         except SessionDead:
             raise
         except RateLimited as exc:
-            last = exc
-            print(f"{route} با ۴۲۹ محدود شد.")
+            blocked = exc
+            print(f"{route} نشد: {exc}")
         except Exception as exc:
-            last = last or exc
+            blocked = exc
             print(f"{route} بی‌نتیجه ماند: {exc}")
-    raise RateLimited(last or "هیچ روشی کار نکرد")
+    raise RateLimited(blocked or "هیچ روشی کار نکرد")
 
 
 def main():
     missing = [k for k in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID") if not os.environ.get(k)]
     if missing:
         sys.exit(f"متغیرهای زیر تنظیم نشده‌اند: {', '.join(missing)}")
+    set_run_deadline()
     config = load_config(os.environ.get("CONFIG", "config.yaml"))
     state = load_state("state.json")
     tracker = Tracker(state)
@@ -451,18 +487,13 @@ def main():
     order = ["feed", "profile"] if config["mode"] == "auto" else [config["mode"]]
 
     delivered = 0
+    worked = []
     for name in order:
+        if worked and name == "profile" and not config["stories"]:
+            break  # feed already carried the posts, and there is nothing left to add
         try:
             delivered += try_strategy(strategies[name], loader, telegram, tracker, config["accounts"], routes)
-            if name == "feed" and config["stories"] and config["mode"] == "auto":
-                print("استوری‌ها فقط از روش profile درمی‌آید؛ آن هم امتحان می‌شود.")
-                try:
-                    delivered += try_strategy(
-                        strategies["profile"], loader, telegram, tracker, config["accounts"], routes
-                    )
-                except (RateLimited, SessionDead) as exc:
-                    print(f"روش profile نشد: {exc}")
-            break
+            worked.append(name)
         except SessionDead as exc:
             print(f"نشست اینستاگرام از کار افتاده: {exc}")
             telegram.notify(
@@ -473,18 +504,19 @@ def main():
             tracker.save()
             sys.exit(1)
         except RateLimited as exc:
-            print(f"روش {name} محدود شد: {exc}")
-            if name == order[-1]:
-                telegram.notify(
-                    "⛔ هم اتصال مستقیم و هم پروکسی‌ها با محدودیت ۴۲۹ اینستاگرام رد شدند. "
-                    "workflow خودکار خاموش می‌شود؛ برای روشن کردن دوباره به Actions بروید."
-                )
-                disable_workflow()
+            print(f"روش {name} به جایی نرسید: {exc}")
 
     tracker.save()
-    print(f"جدید: {delivered} آیتم فرستاده شد")
-    if delivered:
-        telegram.notify(f"✅ {delivered} آیتم تازه از اینستاگرام ارسال شد.")
+    if not worked:
+        telegram.notify(
+            "⛔ هیچ‌کدام از راه‌ها جواب نداد (اتصال مستقیم، پروکسی‌ها، فید و تایم‌لاین). "
+            "workflow خودکار خاموش می‌شود تا اکانت زیر فشار نماند؛ برای روشن کردن دوباره به Actions بروید."
+        )
+        disable_workflow()
+    else:
+        print(f"جدید: {delivered} آیتم فرستاده شد با روش {' + '.join(worked)}")
+        if delivered:
+            telegram.notify(f"✅ {delivered} آیتم تازه از اینستاگرام ارسال شد.")
 
 
 if __name__ == "__main__":

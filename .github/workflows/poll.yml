@@ -36,7 +36,9 @@ jobs:
           WORKFLOW_FILE: poll.yml
           MAX_NEW_PER_RUN: ${{ vars.MAX_NEW_PER_RUN }}
           PROXY_TRIES: ${{ vars.PROXY_TRIES }}
-        run: python bot.py
+          RUN_BUDGET: ${{ vars.RUN_BUDGET }}
+          ROUTE_BUDGET: ${{ vars.ROUTE_BUDGET }}
+        run: python -u bot.py
 
       - name: Commit seen-media state
         if: always()
