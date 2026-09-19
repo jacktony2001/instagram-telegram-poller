@@ -254,21 +254,26 @@ def api_media_urls(item):
     return [u for u in urls if u]
 
 
-def api_caption(owner, item):
+def api_caption(owner, item, link=True):
     stamp = datetime.fromtimestamp(item.get("taken_at") or 0, timezone.utc).strftime("%Y-%m-%d %H:%M")
     lines = [f"{owner} · {stamp}"]
     text = ((item.get("caption") or {}).get("text") or "").strip()
     if text:
         lines.append(text)
-    if item.get("code"):
+    if link and item.get("code"):
         lines.append(f"https://www.instagram.com/p/{item['code']}/")
     return "\n".join(lines)
 
 
-def deliver_api_item(telegram, item, seen, album=True):
+def seen_key(item):
+    """The id a delivered item is remembered by; posts and stories both carry a code."""
+    return str(item.get("code") or item.get("pk"))
+
+
+def deliver_api_item(telegram, item, seen, owner=None, story=False):
     """Download one private-API item from the CDN and upload it. Returns False if nothing arrived."""
-    owner = (item.get("user") or {}).get("username") or "?"
-    key = str(item.get("code") or item.get("pk"))
+    owner = owner or (item.get("user") or {}).get("username") or "?"
+    key = seen_key(item)
     tmp = tempfile.mkdtemp()
     try:
         paths = []
@@ -285,10 +290,10 @@ def deliver_api_item(telegram, item, seen, album=True):
             paths.append(path)
         if not paths:
             return False
-        text = api_caption(owner, item)
+        text = api_caption(owner, item, link=not story)
         print(f"→ {key}: {text[:120]!r}")
         # Telegram caps an album at 10 files, so a longer carousel is split into follow-up albums.
-        chunks = [paths[i : i + 10] for i in range(0, len(paths), 10)] if album else [[p] for p in paths]
+        chunks = [[p] for p in paths] if story else [paths[i : i + 10] for i in range(0, len(paths), 10)]
         sent_ok = True
         for number, chunk in enumerate(chunks, start=1):
             head = text if number == 1 else f"{owner} · ادامه، بخش {number}"
@@ -318,7 +323,7 @@ def run_api(api, telegram, tracker, accounts, fresh_hours=24):
         if account not in wanted:
             continue
         tracker.set_pk(account, user.get("pk"))
-        if str(item.get("code")) in tracker.posts(account):
+        if seen_key(item) in tracker.posts(account):
             continue
         # The home feed is ranked, not chronological, so it hands us month-old posts too.
         if (item.get("taken_at") or 0) < horizon:
@@ -346,14 +351,17 @@ def run_api(api, telegram, tracker, accounts, fresh_hours=24):
             continue
         reel = api.reel(pk)
         seen_stories = tracker.stories(account)
-        pending = [s for s in (reel or {}).get("items") or [] if str(s.get("pk")) not in seen_stories]
+        # Story items carry no username of their own, so the caption takes it from the loop.
+        pending = [s for s in (reel or {}).get("items") or [] if seen_key(s) not in seen_stories]
         pending.sort(key=lambda story: story.get("taken_at") or 0)
         for story in pending:
             check_time()
+            if (story.get("taken_at") or 0) < horizon:
+                continue
             if delivered >= MAX_NEW_PER_RUN:
                 print(f"استوری‌های بیشترِ {account} به اجرای بعدی می‌ماند.")
                 break
-            if deliver_api_item(telegram, story, seen_stories, album=False):
+            if deliver_api_item(telegram, story, seen_stories, owner=account, story=True):
                 delivered += 1
                 tracker.save()
     return delivered
