@@ -6,6 +6,9 @@ from pathlib import Path
 
 from instaloader import Instaloader
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 username = sys.argv[1]
 loader = Instaloader(quiet=True)
 loader.interactive_login(username)

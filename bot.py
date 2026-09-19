@@ -206,6 +206,9 @@ class Seen:
 
 
 def main():
+    missing = [k for k in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID") if not os.environ.get(k)]
+    if missing:
+        sys.exit(f"متغیرهای زیر تنظیم نشده‌اند: {', '.join(missing)}")
     accounts = load_config(os.environ.get("CONFIG", "config.yaml"))
     state = load_state("state.json")
     telegram = Telegram(os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_CHAT_ID"])
