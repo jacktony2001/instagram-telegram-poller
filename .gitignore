@@ -7,3 +7,8 @@ instagram.session
 _set_secrets.py
 
 cookies.txt
+
+.runlog/
+_ig_*.rs
+_omniget_readme.md
+_root_cargo.toml

@@ -3,11 +3,13 @@
 import base64
 import json
 import os
+import pickle
 import random
 import shutil
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
 
@@ -106,8 +108,8 @@ def load_config(path):
     if not accounts:
         sys.exit("config.yaml: هیچ اکانتی در لیست accounts تعریف نشده است.")
     mode = str(data.get("mode", "auto")).strip().lower()
-    if mode not in {"auto", "feed", "profile"}:
-        sys.exit("config.yaml: مقدار mode باید auto یا feed یا profile باشد.")
+    if mode not in {"auto", "api", "feed", "profile"}:
+        sys.exit("config.yaml: مقدار mode باید auto یا api یا feed یا profile باشد.")
     urls = [str(u).strip() for u in data.get("proxy_urls", []) if str(u).strip()]
     return {
         "accounts": accounts,
@@ -165,6 +167,167 @@ def build_loader():
     else:
         sys.exit("متغیر IG_SESSION_B64 یا جفت IG_USER/IG_PASSWORD لازم است.")
     return loader
+
+
+def load_session_cookies():
+    """The pickled instaloader session is a plain cookie name-to-value dict."""
+    blob = os.environ.get("IG_SESSION_B64", "").strip()
+    if not blob:
+        sys.exit("متغیر IG_SESSION_B64 لازم است.")
+    return {k: str(v) for k, v in pickle.loads(base64.b64decode(blob)).items()}
+
+
+class IGApi:
+    """The web API answers 429 to this runner; these private endpoints still answer 200."""
+
+    BASE = "https://i.instagram.com/api/v1"
+    HEADERS = {
+        "X-IG-App-ID": "936619743392459",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "X-Requested-With": "XMLHttpRequest",
+        "X-IG-WWW-Claim": "0",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+        ),
+    }
+
+    def __init__(self, cookies):
+        self.session = requests.Session()
+        self.session.headers.update(self.HEADERS)
+        self.session.cookies.update(cookies)
+
+    def _json(self, path, params=None):
+        resp = self.session.get(self.BASE + path, params=params, timeout=30)
+        if resp.status_code in (401, 403):
+            raise SessionDead(f"{path}: کد {resp.status_code}، نشست رد شد")
+        if resp.status_code == 429:
+            raise RateLimited(f"{path}: ۴۲۹")
+        if not resp.ok:
+            raise RateLimited(f"{path}: کد {resp.status_code}")
+        try:
+            data = resp.json()
+        except ValueError:
+            raise RateLimited(f"{path}: پاسخ JSON نیست") from None
+        if data.get("status") == "fail":
+            raise RateLimited(f"{path}: {str(data.get('message'))[:80]}")
+        return data
+
+    def feed(self, max_pages=3):
+        """Yield media items of the logged-in account's own timeline, newest first."""
+        token = f"{random.randint(10**9, 10**10 - 1)},{random.randint(10**9, 10**10 - 1)}"
+        params = {"rank_token": token, "media_id": ""}
+        for _ in range(max_pages):
+            data = self._json("/feed/timeline/", params)
+            for entry in data.get("feed_items", []):
+                if entry.get("media_or_ad"):
+                    yield entry["media_or_ad"]
+            page = data.get("next_max_id")
+            if not page or not data.get("more_available"):
+                return
+            params = {"rank_token": token, "max_id": page}
+
+    def reel(self, pk):
+        """Active story reel of one account, or None when it has no stories."""
+        try:
+            data = self._json("/feed/reels_media/", {"reel_ids": pk})
+        except SessionDead:
+            raise
+        except RateLimited as exc:
+            print(f"استوری‌های pk={pk} گرفته نشد: {exc}")
+            return None
+        return (data.get("reels") or {}).get(str(pk))
+
+
+def best_candidate(versions):
+    candidates = (versions or {}).get("candidates") or []
+    return candidates[0]["url"] if candidates else None
+
+
+def api_media_urls(item):
+    """Every slide of an item as a direct CDN url."""
+    urls = []
+    for slide in item.get("carousel_media") or [item]:
+        urls.append((slide.get("video_versions") or [{}])[0].get("url") or best_candidate(slide.get("image_versions2")))
+    return [u for u in urls if u]
+
+
+def api_caption(owner, item):
+    stamp = datetime.fromtimestamp(item.get("taken_at") or 0, timezone.utc).strftime("%Y-%m-%d %H:%M")
+    lines = [f"{owner} · {stamp}"]
+    text = ((item.get("caption") or {}).get("text") or "").strip()
+    if text:
+        lines.append(text)
+    if item.get("code"):
+        lines.append(f"https://www.instagram.com/p/{item['code']}/")
+    return "\n".join(lines)
+
+
+def deliver_api_item(telegram, item, seen):
+    """Download one private-API item from the CDN and upload it. Returns False if nothing arrived."""
+    owner = (item.get("user") or {}).get("username") or "?"
+    key = str(item.get("code") or item.get("pk"))
+    tmp = tempfile.mkdtemp()
+    try:
+        paths = []
+        for index, url in enumerate(api_media_urls(item), start=1):
+            suffix = Path(url.split("?")[0]).suffix or ".jpg"
+            try:
+                resp = requests.get(url, timeout=60)
+                resp.raise_for_status()
+            except Exception as exc:
+                print(f"دریافت {key} اسلاید {index} ناموفق بود: {exc}")
+                continue
+            path = Path(tmp) / f"{key}_{index}{suffix}"
+            path.write_bytes(resp.content)
+            paths.append(path)
+        if not paths:
+            return False
+        text = api_caption(owner, item)
+        for index, path in enumerate(paths):
+            telegram.send_media(path, text if index == 0 else f"{owner} · اسلاید {index + 1}")
+        seen.add(key)
+        return True
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def run_api(api, telegram, tracker, accounts):
+    """Follow the accounts through the feed and their story reels, without instaloader."""
+    wanted = set(accounts)
+    delivered = 0
+    for item in api.feed():
+        check_time()
+        user = item.get("user") or {}
+        if user.get("username") not in wanted:
+            continue
+        tracker.set_pk(user["username"], user.get("pk"))
+        if str(item.get("code")) in tracker.posts(user["username"]):
+            continue
+        if delivered >= MAX_NEW_PER_RUN:
+            break
+        if deliver_api_item(telegram, item, tracker.posts(user["username"])):
+            delivered += 1
+            tracker.save()
+
+    for account in accounts:
+        pk = tracker.pk(account)
+        if not pk:
+            continue
+        reel = api.reel(pk)
+        seen_stories = tracker.stories(account)
+        for story in (reel or {}).get("items") or []:
+            check_time()
+            if str(story.get("pk")) in seen_stories:
+                continue
+            if delivered >= MAX_NEW_PER_RUN:
+                print(f"استوری‌های بیشترِ {account} به اجرای بعدی می‌ماند.")
+                break
+            if deliver_api_item(telegram, story, seen_stories):
+                delivered += 1
+                tracker.save()
+    return delivered
 
 
 class Telegram:
@@ -231,7 +394,7 @@ class Tracker:
         self._stories = {}
 
     def _entry(self, account):
-        return self.state.setdefault(account, {"posts": [], "stories": [], "draining": False})
+        return self.state.setdefault(account, {"posts": [], "stories": [], "draining": False, "pk": None})
 
     def _seen(self, account, bucket, keep, cache):
         if account not in cache:
@@ -249,6 +412,13 @@ class Tracker:
 
     def set_draining(self, account, value):
         self._entry(account)["draining"] = bool(value)
+
+    def pk(self, account):
+        return self._entry(account).get("pk")
+
+    def set_pk(self, account, pk):
+        if pk:
+            self._entry(account)["pk"] = int(pk)
 
     def save(self):
         for account, seen in self._posts.items():
@@ -490,16 +660,18 @@ def main():
     loader = build_loader()
 
     routes = ProxyPool(config["proxy_urls"]).routes() if config["proxies"] else [None]
-    strategies = {"feed": run_feed, "profile": partial(run_profile, want_stories=config["stories"])}
-    order = ["feed", "profile"] if config["mode"] == "auto" else [config["mode"]]
+    clients = {"api": IGApi(load_session_cookies()), "loader": loader}
+    strategies = {"api": run_api, "feed": run_feed, "profile": partial(run_profile, want_stories=config["stories"])}
+    order = ["api", "profile"] if config["mode"] == "auto" else [config["mode"]]
 
     delivered = 0
     worked = []
     for name in order:
-        if worked and name == "profile" and not config["stories"]:
-            break  # feed already carried the posts, and there is nothing left to add
+        if worked:
+            break  # the api route already covers posts and stories, so one winner is enough
         try:
-            delivered += try_strategy(strategies[name], loader, telegram, tracker, config["accounts"], routes)
+            client = clients["api"] if name == "api" else clients["loader"]
+            delivered += try_strategy(strategies[name], client, telegram, tracker, config["accounts"], routes)
             worked.append(name)
         except SessionDead as exc:
             print(f"نشست اینستاگرام از کار افتاده: {exc}")
