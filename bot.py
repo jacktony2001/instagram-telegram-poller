@@ -17,7 +17,13 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 
-MAX_NEW_PER_RUN = int(os.environ.get("MAX_NEW_PER_RUN", "10"))
+
+def read_cap():
+    raw = os.environ.get("MAX_NEW_PER_RUN", "").strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else 10
+
+
+MAX_NEW_PER_RUN = read_cap()
 STATE_KEEP_POSTS = 400
 STATE_KEEP_STORIES = 600
 TELEGRAM_PHOTO_LIMIT = 10 * 1024 * 1024

@@ -31,6 +31,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           IG_SESSION_B64: ${{ secrets.IG_SESSION_B64 }}
           IG_USER: ${{ secrets.IG_USER }}
+          MAX_NEW_PER_RUN: ${{ vars.MAX_NEW_PER_RUN }}
         run: python bot.py
 
       - name: Commit seen-media state
