@@ -29,8 +29,9 @@ TARGETS = [
 
 
 def load_cookies():
-    blob = pickle.loads(base64.b64decode(os.environ["IG_SESSION_B64"].strip()))
-    return requests.utils.dict_from_cookiejar(blob["cookiejar"])
+    """instaloader pickles a plain name-to-value cookie dict."""
+    data = pickle.loads(base64.b64decode(os.environ["IG_SESSION_B64"].strip()))
+    return {k: str(v) for k, v in data.items()}
 
 
 def report(name, status, body):
