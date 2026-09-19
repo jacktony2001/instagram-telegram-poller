@@ -1,8 +1,10 @@
 """Build an Instagram session once, locally, and print it for the IG_SESSION_B64 secret.
 
-Run from a terminal that has the project's virtualenv active, then:
-    set IG_PASSWORD        (just the name, no value — cmd prompts you to type it invisibly)
-    python make_session.py your_ig_username
+    .venv/Scripts/python make_session.py your_ig_username      # windows
+    python3 make_session.py your_ig_username                    # linux and mac
+
+The password is asked with a hidden prompt. Setting IG_PASSWORD or IG_2FA_CODE in
+the environment skips those prompts for non-interactive shells.
 """
 
 import base64
