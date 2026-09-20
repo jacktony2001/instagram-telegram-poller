@@ -18,7 +18,6 @@ jobs:
 
       - name: Send fake media through the real delivery code
         env:
-          IG_SESSION_B64: ${{ secrets.IG_SESSION_B64 }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python -u test_delivery.py

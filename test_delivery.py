@@ -123,28 +123,94 @@ def check_api_client():
     api.session = StubSession([StubResponse(429, "throttled", {"Retry-After": "1"}), ok])
     bot.set_run_deadline()
     bot.set_route_deadline()
-    real_sleep = time.sleep
     waits = []
+    real_sleep = time.sleep
     time.sleep = lambda seconds: waits.append(seconds)
     try:
         items = list(api.feed(max_pages=1))
+        print(f"۴۲۹ → تلاش دوباره: آیتم‌ها {items} · صبرها {waits}")
+
+        api.session = StubSession([StubResponse(400, '{"message":"checkpoint_required","lock":true}')])
+        try:
+            list(api.feed(max_pages=1))
+            print("چالش: خطا نداد — این غلط است")
+        except bot.SessionDead as exc:
+            print("چالش درست به SessionDead می‌رسد:", str(exc)[:110])
+
+        api.session = StubSession([requests.exceptions.Timeout()])
+        try:
+            list(api.feed(max_pages=1))
+            print("قطع اتصال: خطا نداد — این غلط است")
+        except bot.RateLimited as exc:
+            print(f"قطع اتصال بعد از {len(api.session.calls)} تلاش می‌گوید: {exc}")
     finally:
         time.sleep = real_sleep
-    print(f"۴۲۹ → تلاش دوباره: آیتم‌ها {items} · صبرها {waits}")
 
-    api.session = StubSession([StubResponse(400, '{"message":"checkpoint_required","lock":true}')])
-    try:
-        list(api.feed(max_pages=1))
-        print("چالش: خطا نداد — این غلط است")
-    except bot.SessionDead as exc:
-        print("چالش درست به SessionDead می‌رسد:", str(exc)[:110])
 
-    api.session = StubSession([requests.exceptions.Timeout()])
+class Recorder:
+    """Counts what Telegram would have received, in order, without uploading 100 files."""
+
+    def __init__(self):
+        self.sent = []
+
+    def send_album(self, paths, caption=None):
+        self.sent.append((len(paths), caption))
+        return True
+
+    def send_media(self, path, caption=None):
+        self.sent.append((1, caption))
+        return True
+
+
+class BusyApi:
+    """One heavy page: fresh posts, month-old posts mixed into the ranked feed, and 30 stories."""
+
+    def __init__(self, now):
+        self.page = {"username": "busypage", "pk": 777}
+        fresh = [self.post(f"F{n}", now - n * 600) for n in range(14)]
+        old = [self.post(f"O{n}", now - (30 + n) * 86400) for n in range(12)]
+        self.items = fresh + old
+        self.stories = [
+            {"code": f"S{n}", "pk": 9000 + n, "taken_at": now - n * 900, "user": self.page,
+             "image_versions2": {"candidates": [{"url": "fake://slide_0.jpg"}]}}
+            for n in range(30)
+        ]
+
+    def post(self, tag, taken_at):
+        return {"code": tag, "pk": hash(tag), "taken_at": taken_at, "user": self.page,
+                "caption": {"text": f"پست {tag}"},
+                "image_versions2": {"candidates": [{"url": "fake://slide_0.jpg"}]}}
+
+    def feed(self):
+        yield from self.items
+
+    def reel(self, pk):
+        return {"items": self.stories}
+
+
+def check_busy_page(payloads):
+    now = int(time.time())
+    api = BusyApi(now)
+    telegram = Recorder()
+    real_requests = bot.requests
+    bot.requests = FakeCdn(payloads, requests)
+    bot.set_run_deadline()
+    bot.set_route_deadline()
     try:
-        list(api.feed(max_pages=1))
-        print("قطع اتصال: خطا نداد — این غلط است")
-    except bot.RateLimited as exc:
-        print(f"قطع اتصال بعد از {len(api.session.calls)} تلاش می‌گوید: {exc}")
+        count = bot.run_api(api, telegram, bot.Tracker({}), ["busypage"],
+                            fresh_hours=24, story_hours=4, story_cap=6)
+    finally:
+        bot.requests = real_requests
+    posts = [c for _, c in telegram.sent if "/p/" in c]
+    stories = [c for _, c in telegram.sent if "/p/" not in c]
+    print(f"ارسال شد: {count} آیتم · پیام‌ها: {len(telegram.sent)} (پست {len(posts)} + استوری {len(stories)})")
+    print(f"سقف پست {bot.MAX_NEW_PER_RUN}: {len(posts) <= bot.MAX_NEW_PER_RUN} · سقف استوری ۶: {len(stories) <= 6} · "
+          f"پست‌های ۳۰ روزه رد شدند: {not any('پست O' in c for c in posts)}")
+    print("ترتیب زمانی پست‌ها (باید قدیمی به تازه):")
+    stamps = [caption.split("\n")[0] for caption in posts]
+    for stamp in stamps:
+        print("   ", stamp)
+    print("ترتیب درست است:", stamps == sorted(stamps))
 
 
 def main():
@@ -173,17 +239,11 @@ def main():
     seen = set()
     print("نتیجه:", bot.deliver_api_item(telegram, broken, seen), "· seen:", seen)
 
-    print("\n--- ۴) وضعیت نشست اینستاگرام (یک درخواست، فقط برای اطلاع) ---")
-    bot.requests = requests
-    try:
-        api = bot.IGApi(bot.load_session_cookies())
-        items = list(api.feed(max_pages=1))
-        owners = sorted({(i.get("user") or {}).get("username") for i in items})
-        print(f"فید زنده است: {len(items)} آیتم · کاربران: {', '.join(filter(None, owners))}")
-    except Exception as exc:
-        print(f"فید بسته است: {type(exc).__name__}: {exc}")
+    print("\n--- ۴) پیج شلوغ: ۱۴ پست تازه + ۱۲ پست ۳۰ روزه + ۳۰ استوری ---")
+    check_busy_page(payloads)
 
     print("\n--- ۵) هدرها و تلاش دوباره، بدون تماس با اینستاگرام ---")
+    bot.requests = requests  # from here on nothing is faked; the checks below never send
     check_api_client()
 
     print("\nپیام‌ها باید در تلگرام دیده شوند؛ اگر آن‌جا نیستند، لاگ بالا خطای تلگرام را چاپ کرده.")

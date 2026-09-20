@@ -45,8 +45,8 @@ PROXY_TRIES = read_int_env("PROXY_TRIES", 8)
 RUN_BUDGET = read_int_env("RUN_BUDGET", 600)
 ROUTE_BUDGET = read_int_env("ROUTE_BUDGET", 150)
 
-RUN_DEADLINE = None
-ROUTE_DEADLINE = None
+RUN_DEADLINE = float("inf")
+ROUTE_DEADLINE = float("inf")
 
 
 def set_run_deadline():
