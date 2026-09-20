@@ -14,9 +14,9 @@ jobs:
         with:
           python-version: "3.12"
 
-      - run: pip install requests
+      - run: pip install requests curl_cffi
 
-      - name: Test Instagram private API endpoints
+      - name: Which Instagram identity answers 200 from the runner
         env:
           IG_SESSION_B64: ${{ secrets.IG_SESSION_B64 }}
-        run: python -u probe_api.py
+        run: python -u probe_matrix.py

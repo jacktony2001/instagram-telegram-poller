@@ -12,6 +12,8 @@ import tempfile
 import time
 from pathlib import Path
 
+import requests
+
 import bot
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -50,8 +52,9 @@ def mp4():
 class FakeCdn:
     """Stands in for the Instagram CDN so the test never touches Instagram."""
 
-    def __init__(self, payloads):
+    def __init__(self, payloads, real):
         self.payloads = payloads
+        self.Session = real.Session  # IGApi below still needs a real session
 
     def get(self, url, timeout=None):
         class Resp:
@@ -88,7 +91,7 @@ def main():
     if video:
         payloads["fake://clip_0.mp4"] = video
     payloads["fake://broken.jpg"] = b"not an image"
-    bot.requests = FakeCdn(payloads)
+    bot.requests = FakeCdn(payloads, requests)
 
     print("\n--- ۱) کاروسل ۱۲ اسلایده: باید دو آلبوم بشود (۱۰ + ۲) ---")
     seen = set()
@@ -108,6 +111,7 @@ def main():
     print("نتیجه:", bot.deliver_api_item(telegram, broken, seen), "· seen:", seen)
 
     print("\n--- ۴) وضعیت نشست اینستاگرام (یک درخواست، فقط برای اطلاع) ---")
+    bot.requests = requests
     try:
         api = bot.IGApi(bot.load_session_cookies())
         items = list(api.feed(max_pages=1))
