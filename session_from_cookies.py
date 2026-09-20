@@ -3,7 +3,7 @@
 No Instagram login happens here, so there is no checkpoint to pass. Write the
 cookies into cookies.txt (git-ignored) as `name=value` lines, then run:
 
-    .venv/Scripts/python session_from_cookies.py jack2001117
+    .venv/Scripts/python session_from_cookies.py your_instagram_username
 
 Minimum cookie names: sessionid, ds_user_id, csrftoken.
 """
