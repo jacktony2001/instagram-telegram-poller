@@ -16,7 +16,7 @@ jobs:
 
       - run: pip install requests curl_cffi
 
-      - name: Which Instagram identity answers 200 from the runner
+      - name: Which route still carries post data
         env:
           IG_SESSION_B64: ${{ secrets.IG_SESSION_B64 }}
-        run: python -u probe_matrix.py
+        run: python -u probe_web.py
