@@ -1,19 +1,21 @@
-"""Throwaway probe: which identity actually makes i.instagram.com answer 200 from the runner.
+"""Throwaway probe: is the Instagram session dead, or only the feed endpoints challenged?
 
-Yesterday's 400 came back as checkpoint_required with lock:true. instagrapi's issues show the
-same body for a mismatched app identity (web app-id on the private host, an old app version in
-the user agent) rather than for a dead session, and the web API is known to fingerprint TLS.
-Each row below is one combination; delete this file with the test-delivery workflow once the
-winner is known.
+The identity matrix answered the first half: the private host returns checkpoint_required for the
+web app-id and challenge_required for the app app-id, so the headers are not the problem. What is
+still unknown is whether the sessionid works anywhere at all, and whether the web API's 429 survives
+curl_cffi's TLS fingerprint. Each row prints the status and what Instagram said.
+Delete this file with the probe workflow once the answer is known.
 """
 
 import base64
+import json
 import os
 import pickle
-import random
+import re
 import sys
 import time
 import uuid
+from random import randint
 
 import requests
 
@@ -27,8 +29,8 @@ CHROME_UA = (
     "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
 )
 INSTAGRAM_UA = "Instagram 448.0.0.0.20 Android (34/14; 420dpi; 1080x2221; Google; Pixel 8 Pro; shiba; samsung; en_US)"
-PRIVATE = "https://i.instagram.com/api/v1"
-PUBLIC = "https://www.instagram.com/api/v1"
+IHOST = "https://i.instagram.com/api/v1"
+WHOST = "https://www.instagram.com/api/v1"
 WWE_PK = "45145019"
 
 
@@ -39,14 +41,11 @@ def session_cookies():
     return {k: str(v) for k, v in pickle.loads(base64.b64decode(blob)).items()}
 
 
-def build_session(transport, headers, jar):
+def make(transport, headers, jar):
     if transport == "cffi":
         from curl_cffi import requests as curl_cffi
 
-        try:
-            session = curl_cffi.Session(impersonate="chrome_126")
-        except Exception:  # the alias depends on the curl_cffi version that got installed
-            session = curl_cffi.Session(impersonate="chrome")
+        session = curl_cffi.Session(impersonate="chrome")
     else:
         session = requests.Session()
     session.headers.update(headers)
@@ -55,28 +54,38 @@ def build_session(transport, headers, jar):
 
 
 def rows(jar):
-    """rank_token of the app API is "<user_id>_<uuid>"; the web one is "<rand>,<rand>"."""
-    if jar.get("ds_user_id"):
-        rank_token = f"{jar['ds_user_id']}_{uuid.uuid4()}"
-    else:
-        rank_token = f"{random.randint(10**9, 10**10 - 1)},{random.randint(10**9, 10**10 - 1)}"
     web = {"User-Agent": CHROME_UA, "X-IG-App-ID": WEB_APP_ID, "Accept-Language": "en-US,en;q=0.9"}
     app = {"User-Agent": INSTAGRAM_UA, "X-IG-App-ID": APP_APP_ID, "X-IG-Connection-Type": "WIFI",
            "Accept-Language": "en-US,en;q=0.9"}
-    timeline = {"rank_token": rank_token, "media_id": ""}
-    user_feed = {"rank_token": rank_token, "ranked_content": "true", "count": "12", "max_id": ""}
+    rank = f"{jar.get('ds_user_id', randint(10**9, 10**10))}_{uuid.uuid4()}"
     return [
-        ("۱ timeline · app-id وب · WWW-Claim 0 · تنظیم فعلی", "requests",
-         dict(web, **{"X-IG-WWW-Claim": "0", "X-Requested-With": "XMLHttpRequest"}), PRIVATE, "/feed/timeline/", timeline),
-        ("۲ timeline · app-id وب · بی WWW-Claim", "requests", web, PRIVATE, "/feed/timeline/", timeline),
-        ("۳ timeline · app-id اپ · UA اینستا", "requests", app, PRIVATE, "/feed/timeline/", timeline),
-        ("۴ timeline · app-id اپ · TLS جعلی", "cffi", app, PRIVATE, "/feed/timeline/", timeline),
-        ("۵ feed/user/<pk> · app-id اپ", "requests", app, PRIVATE, f"/feed/user/{WWE_PK}/", user_feed),
-        ("۶ feed/user/<pk> · app-id اپ · TLS جعلی", "cffi", app, PRIVATE, f"/feed/user/{WWE_PK}/", user_feed),
-        ("۷ reels_media · app-id اپ", "requests", app, PRIVATE, "/feed/reels_media/", {"reel_ids": WWE_PK}),
-        ("۸ web_profile_info · TLS جعلی (کنترل ۴۲۹)", "cffi", dict(web, Referer="https://www.instagram.com/"),
-         PUBLIC, "/users/web_profile_info/", {"username": "wwe"}),
+        # does the sessionid open any door at all, or is the whole account behind a challenge?
+        ("۱ current_user · نشست زنده است؟", "requests", app, IHOST, "/accounts/current_user/", {"edit": "true"}),
+        ("۲ timeline · همان تنظیم ربات", "requests", dict(web, **{"X-IG-WWW-Claim": "0"}),
+         IHOST, "/feed/timeline/", {"rank_token": rank, "media_id": ""}),
+        ("۳ timeline · TLS جعلی", "cffi", dict(web, **{"X-IG-WWW-Claim": "0"}),
+         IHOST, "/feed/timeline/", {"rank_token": rank, "media_id": ""}),
+        ("۴ feed/user · روی میزبان www · TLS جعلی", "cffi", web, WHOST, f"/feed/user/{WWE_PK}/",
+         {"ranked_content": "true", "count": "12"}),
+        ("۵ web_profile_info · روی میزبان www · TLS جعلی", "cffi", dict(web, Referer="https://www.instagram.com/"),
+         "https://www.instagram.com", "/api/v1/users/web_profile_info/", {"username": "wwe"}),
+        ("۶ نمای HTML پروفایل · کوکی نشست · TLS جعلی", "cffi", dict(web, Referer="https://www.instagram.com/"),
+         "https://www.instagram.com", "/wwe/", {}),
+        ("۷ reels_media · روی میزبان www · TLS جعلی", "cffi", web, WHOST, "/feed/reels_media/",
+         {"reel_ids": WWE_PK}),
     ]
+
+
+def describe(body):
+    """Instagram buries the useful part in a JSON blob; quote the message and the challenge link."""
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return " ".join(body[:160].split())
+    message = data.get("message") or data.get("error_type") or "?"
+    found = re.search(r"https://www\.instagram\.com/(challenge|accounts/[a-z_]+)[^\"\\]*", body)
+    link = f"\n      بازکردنی: {found.group(0)}" if found else ""
+    return f"{message} · {json.dumps({k: v for k, v in data.items() if k != 'checkpoint_url'}, ensure_ascii=False)[:150]}{link}"
 
 
 def main():
@@ -84,12 +93,11 @@ def main():
     print(f"کوکی‌های موجود: {', '.join(sorted(jar))}\n")
     for label, transport, headers, base, path, params in rows(jar):
         try:
-            resp = build_session(transport, headers, jar).get(base + path, params=params, timeout=30)
-            body = " ".join(resp.text[:180].split())
-            print(f"{resp.status_code:>3} · {label}\n      {path} → {body}\n")
+            resp = make(transport, headers, jar).get(base + path, params=params, timeout=30)
+            print(f"{resp.status_code:>3} · {label}\n      {describe(resp.text)}\n")
         except Exception as exc:
             print(f"ERR · {label}\n      {type(exc).__name__}: {exc}\n")
-        time.sleep(1)
+        time.sleep(2)
 
 
 if __name__ == "__main__":
