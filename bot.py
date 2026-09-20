@@ -26,6 +26,7 @@ STATE_KEEP_POSTS = 400
 STATE_KEEP_STORIES = 600
 TELEGRAM_PHOTO_LIMIT = 10 * 1024 * 1024
 TELEGRAM_VIDEO_LIMIT = 50 * 1024 * 1024
+TELEGRAM_PAUSE = 1.5
 MEDIA_SUFFIXES = {".jpg", ".jpeg", ".png", ".mp4"}
 PROXY_LIST_URLS = [
     "https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/protocols/http/data.txt",
@@ -118,6 +119,8 @@ def load_config(path):
         "proxies": bool(data.get("proxies", True)),
         "proxy_urls": urls or PROXY_LIST_URLS,
         "max_post_age_hours": int(data.get("max_post_age_hours", 24) or 24),
+        "max_story_age_hours": int(data.get("max_story_age_hours", 4) or 4),
+        "max_stories_per_run": int(data.get("max_stories_per_run", 6) or 6),
     }
 
 
@@ -201,33 +204,42 @@ class IGApi:
 
     def _json(self, path, params=None):
         resp = self.session.get(self.BASE + path, params=params, timeout=30)
-        if resp.status_code in (401, 403):
-            raise SessionDead(f"{path}: کد {resp.status_code}، نشست رد شد")
-        if resp.status_code == 429:
-            raise RateLimited(f"{path}: ۴۲۹")
-        if not resp.ok:
-            raise RateLimited(f"{path}: کد {resp.status_code}")
-        try:
-            data = resp.json()
-        except ValueError:
-            raise RateLimited(f"{path}: پاسخ JSON نیست") from None
-        if data.get("status") == "fail":
-            raise RateLimited(f"{path}: {str(data.get('message'))[:80]}")
-        return data
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+            except ValueError:
+                raise RateLimited(f"{path}: پاسخ JSON نیست") from None
+            if data.get("status") == "fail":
+                raise RateLimited(f"{path}: {str(data.get('message'))[:160]}")
+            return data
+        # Without the body we cannot tell a throttle from a challenge, so quote what Instagram said.
+        detail = " ".join(resp.text[:200].split())
+        if resp.status_code in (401, 403) or "feedback_required" in detail or "checkpoint" in detail:
+            raise SessionDead(f"{path}: کد {resp.status_code} · {detail}")
+        raise RateLimited(f"{path}: کد {resp.status_code} · {detail}")
 
     def feed(self, max_pages=3):
         """Yield media items of the logged-in account's own timeline, newest first."""
         token = f"{random.randint(10**9, 10**10 - 1)},{random.randint(10**9, 10**10 - 1)}"
-        params = {"rank_token": token, "media_id": ""}
-        for _ in range(max_pages):
-            data = self._json("/feed/timeline/", params)
+        cursor = None
+        for number in range(max_pages):
+            params = {"rank_token": token, "media_id": ""} if cursor is None else {"rank_token": token, "max_id": cursor}
+            try:
+                data = self._json("/feed/timeline/", params)
+            except SessionDead:
+                raise
+            except RateLimited as exc:
+                if number == 0:
+                    raise
+                # A stale cursor must not throw away the pages we already have.
+                print(f"صفحه‌ی {number + 1} فید نیامد: {exc}")
+                return
             for entry in data.get("feed_items", []):
                 if entry.get("media_or_ad"):
                     yield entry["media_or_ad"]
-            page = data.get("next_max_id")
-            if not page or not data.get("more_available"):
+            cursor = data.get("next_max_id")
+            if not cursor or not data.get("more_available"):
                 return
-            params = {"rank_token": token, "max_id": page}
 
     def reel(self, pk):
         """Active story reel of one account, or None when it has no stories."""
@@ -311,10 +323,11 @@ def deliver_api_item(telegram, item, seen, owner=None, story=False):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def run_api(api, telegram, tracker, accounts, fresh_hours=24):
+def run_api(api, telegram, tracker, accounts, fresh_hours=24, story_hours=4, story_cap=6):
     """Follow the accounts through the feed and their story reels, without instaloader."""
     wanted = set(accounts)
     horizon = time.time() - fresh_hours * 3600
+    story_horizon = time.time() - story_hours * 3600
     candidates, stale = [], 0
     for item in api.feed():
         check_time()
@@ -345,6 +358,8 @@ def run_api(api, telegram, tracker, accounts, fresh_hours=24):
             delivered += 1
             tracker.save()
 
+    # A reel holds a whole day of stories, so they get their own, much tighter window:
+    # anything older than a few poll intervals is history the user already walked past.
     for account in accounts:
         pk = tracker.pk(account)
         if not pk:
@@ -352,15 +367,14 @@ def run_api(api, telegram, tracker, accounts, fresh_hours=24):
         reel = api.reel(pk)
         seen_stories = tracker.stories(account)
         # Story items carry no username of their own, so the caption takes it from the loop.
-        pending = [s for s in (reel or {}).get("items") or [] if seen_key(s) not in seen_stories]
+        pending = [
+            s
+            for s in (reel or {}).get("items") or []
+            if seen_key(s) not in seen_stories and (s.get("taken_at") or 0) >= story_horizon
+        ]
         pending.sort(key=lambda story: story.get("taken_at") or 0)
-        for story in pending:
+        for story in pending[:story_cap]:
             check_time()
-            if (story.get("taken_at") or 0) < horizon:
-                continue
-            if delivered >= MAX_NEW_PER_RUN:
-                print(f"استوری‌های بیشترِ {account} به اجرای بعدی می‌ماند.")
-                break
             if deliver_api_item(telegram, story, seen_stories, owner=account, story=True):
                 delivered += 1
                 tracker.save()
@@ -378,9 +392,13 @@ class Telegram:
         resp = self.session.post(url, data=payload, files=files, timeout=120)
         if resp.status_code == 429:
             time.sleep(resp.json().get("parameters", {}).get("retry_after", 5))
+            for fh in (files or {}).values():
+                fh.seek(0)  # a retried upload reads from where it stopped, and Telegram gets an empty file
             resp = self.session.post(url, data=payload, files=files, timeout=120)
         if not resp.ok:
             print(f"تلگرام {method} خطا: {resp.text[:300]}")
+        if files:
+            time.sleep(TELEGRAM_PAUSE)  # a bot may post about one message per second per chat
         return resp.json().get("ok")
 
     def _kind(self, path):
@@ -717,7 +735,12 @@ def main():
     routes = ProxyPool(config["proxy_urls"]).routes() if config["proxies"] else [None]
     clients = {"api": IGApi(load_session_cookies()), "loader": loader}
     strategies = {
-        "api": partial(run_api, fresh_hours=config["max_post_age_hours"]),
+        "api": partial(
+            run_api,
+            fresh_hours=config["max_post_age_hours"],
+            story_hours=config["max_story_age_hours"],
+            story_cap=config["max_stories_per_run"],
+        ),
         "feed": run_feed,
         "profile": partial(run_profile, want_stories=config["stories"]),
     }
@@ -725,6 +748,7 @@ def main():
 
     delivered = 0
     worked = []
+    failures = []
     for name in order:
         if worked:
             break  # the api route already covers posts and stories, so one winner is enough
@@ -735,20 +759,22 @@ def main():
         except SessionDead as exc:
             print(f"نشست اینستاگرام از کار افتاده: {exc}")
             telegram.notify(
-                "⛔ اینستاگرام نشست را بازرسی خواسته؛ پروکسی فایده ندارد. "
-                "یک نشست تازه بسازید و IG_SESSION_B64 را عوض کنید. ربات خودکار خاموش شد."
+                "⛔ اینستاگرام نشست را به بررسی کشیده؛ پروکسی فایده‌ای ندارد. "
+                "یک نشست تازه بساز و IG_SESSION_B64 را عوض کن. ربات خودکار خاموش شد.\n"
+                f"دلیل: {exc}"
             )
             disable_workflow()
             tracker.save()
             sys.exit(1)
         except RateLimited as exc:
             print(f"روش {name} به جایی نرسید: {exc}")
+            failures.append(f"{name}: {exc}")
 
     tracker.save()
     if not worked:
         telegram.notify(
-            "⛔ هیچ‌کدام از راه‌ها جواب نداد (اتصال مستقیم، پروکسی‌ها، فید و تایم‌لاین). "
-            "workflow خودکار خاموش می‌شود تا اکانت زیر فشار نماند؛ برای روشن کردن دوباره به Actions بروید."
+            "⛔ هیچ‌کدام از راه‌ها جواب نداد و workflow خودکار خاموش می‌شود تا اکانت زیر فشار نماند. "
+            "برای روشن کردن دوباره به Actions برو.\n" + "\n".join(failures)
         )
         disable_workflow()
     else:
