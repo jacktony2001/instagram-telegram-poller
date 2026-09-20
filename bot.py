@@ -9,6 +9,7 @@ import shutil
 import sys
 import tempfile
 import time
+import uuid
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
@@ -182,18 +183,19 @@ def load_session_cookies():
 
 
 class IGApi:
-    """The web API answers 429 to this runner; these private endpoints still answer 200."""
+    """Instagram's private app API. The web API answers 429 to this runner; these endpoints are the
+    ones the official app uses, so they are asked with the app's own identity. The identity was
+    checked on 2026-09-20: it does not lift a checkpoint, but it is what the API expects."""
 
     BASE = "https://i.instagram.com/api/v1"
     HEADERS = {
-        "X-IG-App-ID": "936619743392459",
+        "X-IG-App-ID": "567067343352427",
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
-        "X-Requested-With": "XMLHttpRequest",
-        "X-IG-WWW-Claim": "0",
+        "X-IG-Connection-Type": "WIFI",
         "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+            "Instagram 448.0.0.0.20 Android (34/14; 420dpi; 1080x2221; Google; Pixel 8 Pro; "
+            "shiba; samsung; en_US)"
         ),
     }
 
@@ -201,9 +203,34 @@ class IGApi:
         self.session = requests.Session()
         self.session.headers.update(self.HEADERS)
         self.session.cookies.update(cookies)
+        # The app's rank_token is "<user id>_<uuid>"; the random one the web page uses is a guess.
+        user_id = cookies.get("ds_user_id") or ""
+        self.rank_token = f"{user_id}_{uuid.uuid4().hex}" if user_id else uuid.uuid4().hex
+
+    def _request(self, path, params=None):
+        """One GET, retried for the two things waiting fixes: a throttle and a dropped connection."""
+        delay = 20
+        for attempt in (1, 2, 3):
+            check_time()
+            try:
+                resp = self.session.get(self.BASE + path, params=params, timeout=30)
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                problem = f"قطع اتصال ({type(exc).__name__})"
+            else:
+                if resp.status_code != 429:
+                    return resp
+                problem = "۴۲۹ اینستاگرام"
+                waited = resp.headers.get("Retry-After", "")
+                if waited.isdigit():
+                    delay = max(delay, min(int(waited), 60))
+            if attempt == 3:
+                raise RateLimited(f"{path}: {problem} · بعد از سه تلاش")
+            print(f"{path}: {problem} — {delay} ثانیه صبر")
+            time.sleep(delay)
+            delay *= 2
 
     def _json(self, path, params=None):
-        resp = self.session.get(self.BASE + path, params=params, timeout=30)
+        resp = self._request(path, params)
         if resp.status_code == 200:
             try:
                 data = resp.json()
@@ -215,15 +242,23 @@ class IGApi:
         # Without the body we cannot tell a throttle from a challenge, so quote what Instagram said.
         detail = " ".join(resp.text[:200].split())
         if resp.status_code in (401, 403) or "feedback_required" in detail or "checkpoint" in detail:
-            raise SessionDead(f"{path}: کد {resp.status_code} · {detail}")
+            challenged = "checkpoint" in detail or "challenge" in detail
+            reason = "چالش انسانی" if challenged else "ورود دوباره"
+            raise SessionDead(
+                f"{path}: کد {resp.status_code} · {reason} · {detail[:120]}"
+                + (" · https://www.instagram.com/challenge/" if challenged else "")
+            )
         raise RateLimited(f"{path}: کد {resp.status_code} · {detail}")
 
     def feed(self, max_pages=3):
         """Yield media items of the logged-in account's own timeline, newest first."""
-        token = f"{random.randint(10**9, 10**10 - 1)},{random.randint(10**9, 10**10 - 1)}"
         cursor = None
         for number in range(max_pages):
-            params = {"rank_token": token, "media_id": ""} if cursor is None else {"rank_token": token, "max_id": cursor}
+            params = {"rank_token": self.rank_token}
+            if cursor:
+                params["max_id"] = cursor
+            else:
+                params["media_id"] = ""
             try:
                 data = self._json("/feed/timeline/", params)
             except SessionDead:

@@ -5,6 +5,7 @@ that workflow once the album path is proven.
 """
 
 import io
+import json
 import os
 import subprocess
 import sys
@@ -84,6 +85,68 @@ def carousel(slides, video_at=None, video=None):
     }
 
 
+class StubResponse:
+    def __init__(self, code, body="", headers=None):
+        self.status_code = code
+        self.text = body
+        self.headers = headers or {}
+
+    def json(self):
+        return json.loads(self.text)
+
+
+class StubSession:
+    """Feeds IGApi canned answers so the retry logic can be watched without calling Instagram."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.headers = {}
+        self.cookies = {}
+        self.calls = []
+
+    def get(self, url, params=None, timeout=None):
+        self.calls.append((url, params))
+        item = self.responses[min(len(self.calls) - 1, len(self.responses) - 1)]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def check_api_client():
+    api = bot.IGApi({"sessionid": "x", "ds_user_id": "1234567890"})
+    print("app-id:", api.session.headers["X-IG-App-ID"], "· WWW-Claim:",
+          "X-IG-WWW-Claim" in api.session.headers, "· rank_token:", api.rank_token)
+    print("UA:", api.session.headers["User-Agent"][:40], "…")
+
+    ok = StubResponse(200, json.dumps({"feed_items": [{"media_or_ad": {"code": "A", "taken_at": 1}}],
+                                       "next_max_id": "c2", "more_available": True}))
+    api.session = StubSession([StubResponse(429, "throttled", {"Retry-After": "1"}), ok])
+    bot.set_run_deadline()
+    bot.set_route_deadline()
+    real_sleep = time.sleep
+    waits = []
+    time.sleep = lambda seconds: waits.append(seconds)
+    try:
+        items = list(api.feed(max_pages=1))
+    finally:
+        time.sleep = real_sleep
+    print(f"۴۲۹ → تلاش دوباره: آیتم‌ها {items} · صبرها {waits}")
+
+    api.session = StubSession([StubResponse(400, '{"message":"checkpoint_required","lock":true}')])
+    try:
+        list(api.feed(max_pages=1))
+        print("چالش: خطا نداد — این غلط است")
+    except bot.SessionDead as exc:
+        print("چالش درست به SessionDead می‌رسد:", str(exc)[:110])
+
+    api.session = StubSession([requests.exceptions.Timeout()])
+    try:
+        list(api.feed(max_pages=1))
+        print("قطع اتصال: خطا نداد — این غلط است")
+    except bot.RateLimited as exc:
+        print(f"قطع اتصال بعد از {len(api.session.calls)} تلاش می‌گوید: {exc}")
+
+
 def main():
     telegram = bot.Telegram(os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_CHAT_ID"])
     payloads = {f"fake://slide_{n}.jpg": jpeg(str(n)) for n in range(12)}
@@ -119,6 +182,9 @@ def main():
         print(f"فید زنده است: {len(items)} آیتم · کاربران: {', '.join(filter(None, owners))}")
     except Exception as exc:
         print(f"فید بسته است: {type(exc).__name__}: {exc}")
+
+    print("\n--- ۵) هدرها و تلاش دوباره، بدون تماس با اینستاگرام ---")
+    check_api_client()
 
     print("\nپیام‌ها باید در تلگرام دیده شوند؛ اگر آن‌جا نیستند، لاگ بالا خطای تلگرام را چاپ کرده.")
 
