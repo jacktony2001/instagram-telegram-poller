@@ -57,23 +57,35 @@ def judge(resp):
     return bool(found)
 
 
+def sessions():
+    """The same request twice: plain requests, then curl_cffi with a browser TLS handshake, because
+    a Cloudflare 403 sometimes only cares about the fingerprint."""
+    plain = requests.Session()
+    plain.headers.update(HEADERS)
+    yield "requests", plain
+    try:
+        from curl_cffi import requests as curl_cffi
+    except ImportError:
+        return
+    cffi = curl_cffi.Session(impersonate="chrome")
+    cffi.headers.update(HEADERS)
+    yield "chrome-tls", cffi
+
+
 def main():
     for label, url in SOURCES:
         print(f"\n{label}\n  {url}")
-        try:
-            resp = requests.get(url, headers=HEADERS, timeout=25, allow_redirects=True)
-            ok = judge(resp)
-        except Exception as exc:
-            print(f"  ERR {type(exc).__name__}: {str(exc)[:160]}")
-            continue
-        if ok:
-            time.sleep(1)
+        for transport, session in sessions():
+            print(f"  [{transport}]")
             try:
-                ghost = requests.get(url.replace(USER, BROKEN), headers=HEADERS, timeout=25)
-                print(f"  کاربر جعلی: {ghost.status_code} · {len(ghost.text)} کاراکتر")
+                resp = session.get(url, timeout=25, allow_redirects=True)
+                ok = judge(resp)
+                if ok:
+                    ghost = session.get(url.replace(USER, BROKEN), timeout=25)
+                    print(f"  کاربر جعلی: {ghost.status_code} · {len(ghost.text)} کاراکتر")
             except Exception as exc:
-                print(f"  کاربر جعلی: ERR {type(exc).__name__}")
-        time.sleep(1)
+                print(f"  ERR {type(exc).__name__}: {str(exc)[:150]}")
+            time.sleep(1)
 
 
 if __name__ == "__main__":

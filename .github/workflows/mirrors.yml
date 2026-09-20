@@ -14,7 +14,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - run: pip install requests
+      - run: pip install requests curl_cffi
 
       - name: Ask public Instagram mirrors for the same data
         run: python -u probe_mirrors.py
