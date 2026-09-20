@@ -16,8 +16,5 @@ jobs:
 
       - run: pip install requests curl_cffi
 
-      - name: Ask public RSS-Bridge instances for the same data
-        run: python -u probe_rssbridge.py
-
-      - name: Ask public Instagram mirrors for the same data
-        run: python -u probe_mirrors.py
+      - name: Ask Instagram's own anonymous embed endpoints
+        run: python -u probe_embed.py
