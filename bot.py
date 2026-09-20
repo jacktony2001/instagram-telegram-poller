@@ -1,4 +1,18 @@
-"""Poll Instagram accounts for new posts and stories, forward them to Telegram."""
+"""Poll Instagram accounts for new posts and stories, forward them to Telegram.
+
+WARNING — read before you run this.
+
+* This bot talks to Instagram through the private API the official mobile app uses. That
+  is not a permitted public interface: it breaches Instagram's Terms of Service, and the
+  account behind the session can be rate-limited, checkpointed or banned for it. Run it
+  only against an account you own and pages you are allowed to archive.
+* IG_SESSION_B64 is a login session. Whoever holds it *is* that account — same for the
+  Telegram bot token. Never print either value, never commit them, and rotate them the
+  moment they leak or this repo changes hands.
+* The routes were measured on 2026-09-20 from a GitHub runner; Instagram changes without
+  notice, so treat every "this works" note here as history, not a guarantee.
+* There is no warranty. Media you download stays your responsibility.
+"""
 
 import base64
 import json
@@ -62,9 +76,9 @@ def set_route_deadline():
 def check_time():
     """Raise out of a scan when the job would otherwise be killed by the runner."""
     if time.monotonic() > ROUTE_DEADLINE:
-        raise TooSlow("وقت این روش تمام شد")
+        raise TooSlow("this route's time budget is spent")
     if time.monotonic() > RUN_DEADLINE:
-        raise RateLimited("وقت کل job تمام شد")
+        raise RateLimited("the whole job's time budget is spent")
 
 
 def direct_session():
@@ -108,10 +122,10 @@ def load_config(path):
         data = yaml.safe_load(fh) or {}
     accounts = [str(a).strip().lstrip("@") for a in data.get("accounts", [])]
     if not accounts:
-        sys.exit("config.yaml: هیچ اکانتی در لیست accounts تعریف نشده است.")
+        sys.exit("config.yaml: the accounts list is empty.")
     mode = str(data.get("mode", "auto")).strip().lower()
     if mode not in {"auto", "api", "feed", "profile"}:
-        sys.exit("config.yaml: مقدار mode باید auto یا api یا feed یا profile باشد.")
+        sys.exit("config.yaml: mode must be one of auto, api, feed, profile.")
     urls = [str(u).strip() for u in data.get("proxy_urls", []) if str(u).strip()]
     return {
         "accounts": accounts,
@@ -157,7 +171,7 @@ def build_loader():
 
     session_b64 = os.environ.get("IG_SESSION_B64", "").strip()
     if session_b64:
-        username = os.environ.get("IG_USER") or sys.exit("با IG_SESSION_B64، متغیر IG_USER هم لازم است.")
+        username = os.environ.get("IG_USER") or sys.exit("IG_SESSION_B64 also needs the IG_USER variable.")
         session_file = tempfile.NamedTemporaryFile(delete=False, suffix=".session").name
         try:
             with open(session_file, "wb") as fh:
@@ -168,9 +182,9 @@ def build_loader():
     elif os.environ.get("IG_USER") and os.environ.get("IG_PASSWORD"):
         loader.login(os.environ["IG_USER"], os.environ["IG_PASSWORD"])
         loader.save_session_to_file("instagram.session")
-        print("یک نشست تازه ساخته شد؛ محتوای instagram.session را در IG_SESSION_B64 بگذارید.")
+        print("A fresh session was built; put the contents of instagram.session into IG_SESSION_B64.")
     else:
-        sys.exit("متغیر IG_SESSION_B64 یا جفت IG_USER/IG_PASSWORD لازم است.")
+        sys.exit("Either IG_SESSION_B64 or the IG_USER/IG_PASSWORD pair is required.")
     return loader
 
 
@@ -178,7 +192,7 @@ def load_session_cookies():
     """The pickled instaloader session is a plain cookie name-to-value dict."""
     blob = os.environ.get("IG_SESSION_B64", "").strip()
     if not blob:
-        sys.exit("متغیر IG_SESSION_B64 لازم است.")
+        sys.exit("The IG_SESSION_B64 variable is required.")
     return {k: str(v) for k, v in pickle.loads(base64.b64decode(blob)).items()}
 
 
@@ -215,17 +229,17 @@ class IGApi:
             try:
                 resp = self.session.get(self.BASE + path, params=params, timeout=30)
             except (requests.ConnectionError, requests.Timeout) as exc:
-                problem = f"قطع اتصال ({type(exc).__name__})"
+                problem = f"connection dropped ({type(exc).__name__})"
             else:
                 if resp.status_code != 429:
                     return resp
-                problem = "۴۲۹ اینستاگرام"
+                problem = "Instagram 429"
                 waited = resp.headers.get("Retry-After", "")
                 if waited.isdigit():
                     delay = max(delay, min(int(waited), 60))
             if attempt == 3:
-                raise RateLimited(f"{path}: {problem} · بعد از سه تلاش")
-            print(f"{path}: {problem} — {delay} ثانیه صبر")
+                raise RateLimited(f"{path}: {problem} · after three tries")
+            print(f"{path}: {problem} — waiting {delay} seconds")
             time.sleep(delay)
             delay *= 2
 
@@ -235,7 +249,7 @@ class IGApi:
             try:
                 data = resp.json()
             except ValueError:
-                raise RateLimited(f"{path}: پاسخ JSON نیست") from None
+                raise RateLimited(f"{path}: the response is not JSON") from None
             if data.get("status") == "fail":
                 raise RateLimited(f"{path}: {str(data.get('message'))[:160]}")
             return data
@@ -243,12 +257,12 @@ class IGApi:
         detail = " ".join(resp.text[:200].split())
         if resp.status_code in (401, 403) or "feedback_required" in detail or "checkpoint" in detail:
             challenged = "checkpoint" in detail or "challenge" in detail
-            reason = "چالش انسانی" if challenged else "ورود دوباره"
+            reason = "human challenge" if challenged else "re-login needed"
             raise SessionDead(
-                f"{path}: کد {resp.status_code} · {reason} · {detail[:120]}"
+                f"{path}: code {resp.status_code} · {reason} · {detail[:120]}"
                 + (" · https://www.instagram.com/challenge/" if challenged else "")
             )
-        raise RateLimited(f"{path}: کد {resp.status_code} · {detail}")
+        raise RateLimited(f"{path}: code {resp.status_code} · {detail}")
 
     def feed(self, max_pages=3):
         """Yield media items of the logged-in account's own timeline, newest first."""
@@ -267,7 +281,7 @@ class IGApi:
                 if number == 0:
                     raise
                 # A stale cursor must not throw away the pages we already have.
-                print(f"صفحه‌ی {number + 1} فید نیامد: {exc}")
+                print(f"feed page {number + 1} did not arrive: {exc}")
                 return
             for entry in data.get("feed_items", []):
                 if entry.get("media_or_ad"):
@@ -283,7 +297,7 @@ class IGApi:
         except SessionDead:
             raise
         except RateLimited as exc:
-            print(f"استوری‌های pk={pk} گرفته نشد: {exc}")
+            print(f"stories of pk={pk} could not be fetched: {exc}")
             return None
         return (data.get("reels") or {}).get(str(pk))
 
@@ -330,7 +344,7 @@ def deliver_api_item(telegram, item, seen, owner=None, story=False):
                 resp = requests.get(url, timeout=60)
                 resp.raise_for_status()
             except Exception as exc:
-                print(f"دریافت {key} اسلاید {index} ناموفق بود: {exc}")
+                print(f"slide {index} of {key} failed to download: {exc}")
                 continue
             path = Path(tmp) / f"{key}_{index}{suffix}"
             path.write_bytes(resp.content)
@@ -343,7 +357,7 @@ def deliver_api_item(telegram, item, seen, owner=None, story=False):
         chunks = [[p] for p in paths] if story else [paths[i : i + 10] for i in range(0, len(paths), 10)]
         sent_ok = True
         for number, chunk in enumerate(chunks, start=1):
-            head = text if number == 1 else f"{owner} · ادامه، بخش {number}"
+            head = text if number == 1 else f"{owner} · continued, part {number}"
             if len(chunk) > 1:
                 result = telegram.send_album(chunk, head)
             else:
@@ -379,13 +393,13 @@ def run_api(api, telegram, tracker, accounts, fresh_hours=24, story_hours=4, sto
             continue
         candidates.append(item)
     if stale:
-        print(f"{stale} آیتم قدیمی‌تر از {fresh_hours} ساعت رد شد.")
+        print(f"{stale} items older than {fresh_hours} hours were skipped.")
 
     # Take the newest ones, then send them oldest-first so the chat reads in order.
     candidates.sort(key=lambda item: item.get("taken_at") or 0, reverse=True)
     batch = candidates[:MAX_NEW_PER_RUN]
     if len(candidates) > len(batch):
-        print(f"{len(candidates) - len(batch)} آیتم برای اجرای بعدی می‌ماند.")
+        print(f"{len(candidates) - len(batch)} items are left for the next run.")
     delivered = 0
     for item in sorted(batch, key=lambda item: item.get("taken_at") or 0):
         account = (item.get("user") or {}).get("username")
@@ -431,7 +445,7 @@ class Telegram:
                 fh.seek(0)  # a retried upload reads from where it stopped, and Telegram gets an empty file
             resp = self.session.post(url, data=payload, files=files, timeout=120)
         if not resp.ok:
-            print(f"تلگرام {method} خطا: {resp.text[:300]}")
+            print(f"Telegram {method} error: {resp.text[:300]}")
         if files:
             time.sleep(TELEGRAM_PAUSE)  # a bot may post about one message per second per chat
         return resp.json().get("ok")
@@ -548,7 +562,7 @@ class ProxyPool:
                 resp = self.session.get(url, timeout=30)
                 resp.raise_for_status()
             except Exception as exc:
-                print(f"لیست پروکسی گرفته نشد ({url}): {exc}")
+                print(f"proxy list could not be fetched ({url}): {exc}")
                 continue
             for line in resp.text.splitlines():
                 proxy = line.strip()
@@ -557,7 +571,7 @@ class ProxyPool:
                     found.append(proxy)
         random.shuffle(found)
         self.queue = found[:PROXY_TRIES]
-        print(f"{len(self.queue)} پروکسی برای آزمایش آماده است.")
+        print(f"{len(self.queue)} proxies are ready to try.")
 
     def routes(self):
         """The direct address first, then every proxy."""
@@ -593,16 +607,16 @@ def deliver_post(loader, post, telegram, seen_posts):
             downloaded = loader.download_post(post, target=tmp)
         except Exception as exc:
             rethrow(exc)
-            print(f"پست {post.shortcode} خطا: {exc}")
+            print(f"post {post.shortcode} error: {exc}")
             return False
         if not downloaded:
-            print(f"دانلود پست {post.shortcode} ناموفق بود")
+            print(f"post {post.shortcode} did not download")
             return False
         files = collect_files(tmp)
         owner = post.owner_profile.username
         text = caption_for(post)
         for index, path in enumerate(files):
-            telegram.send_media(path, text if index == 0 else f"{owner} · اسلاید {index + 1}")
+            telegram.send_media(path, text if index == 0 else f"{owner} · slide {index + 1}")
         seen_posts.add(post.shortcode)
         return True
     finally:
@@ -648,7 +662,7 @@ def run_profile(loader, telegram, tracker, accounts, want_stories):
         except Exception as exc:
             rethrow(exc)
             blocked = exc
-            print(f"اکانت {username} خطا: {exc}")
+            print(f"account {username} error: {exc}")
         tracker.save()
     if scanned == 0 and blocked is not None:
         raise RateLimited(blocked)
@@ -689,7 +703,7 @@ def fetch_new_stories(loader, profile, telegram, tracker):
         if item.mediaid in seen_stories:
             continue
         if delivered >= MAX_NEW_PER_RUN:
-            print(f"استوری‌های بیشترِ {username} به اجرای بعدی می‌ماند.")
+            print(f"more stories from {username} are left for the next run.")
             break
         tmp = tempfile.mkdtemp()
         try:
@@ -697,11 +711,11 @@ def fetch_new_stories(loader, profile, telegram, tracker):
                 loader.download_storyitem(item, target=tmp)
             except Exception as exc:
                 rethrow(exc)
-                print(f"استوری {item.mediaid} خطا: {exc}")
+                print(f"story {item.mediaid} error: {exc}")
                 continue
             for index, path in enumerate(collect_files(tmp)):
-                text = f"{username} · استوری · {item.date_local:%H:%M}"
-                telegram.send_media(path, text if index == 0 else f"{username} · استوری {index + 1}")
+                text = f"{username} · story · {item.date_local:%H:%M}"
+                telegram.send_media(path, text if index == 0 else f"{username} · story {index + 1}")
                 delivered += 1
             seen_stories.add(item.mediaid)
             tracker.save()
@@ -716,7 +730,7 @@ def disable_workflow():
     repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
     workflow = os.environ.get("WORKFLOW_FILE", "poll.yml").strip()
     if not token or not repo:
-        print("برای خاموش کردن workflow متغیرهای ACTIONS_TOKEN و GITHUB_REPOSITORY لازم‌اند.")
+        print("ACTIONS_TOKEN and GITHUB_REPOSITORY are needed to disable the workflow.")
         return False
     resp = direct_session().put(
         f"https://api.github.com/repos/{repo}/actions/workflows/{workflow}/disable",
@@ -727,7 +741,7 @@ def disable_workflow():
         },
         timeout=30,
     )
-    print(f"خاموش کردن workflow: کد {resp.status_code}")
+    print(f"workflow disable: code {resp.status_code}")
     return resp.ok
 
 
@@ -736,30 +750,30 @@ def try_strategy(strategy, loader, telegram, tracker, accounts, routes):
     blocked = None
     for proxy in routes:
         if time.monotonic() > RUN_DEADLINE:
-            raise RateLimited(blocked or "وقت کل job تمام شد")
+            raise RateLimited(blocked or "the whole job's time budget is spent")
         apply_proxy(proxy)
         set_route_deadline()
-        route = "اتصال مستقیم" if proxy is None else f"پروکسی {proxy}"
-        print(f"امتحان با {route} …")
+        route = "direct connection" if proxy is None else f"proxy {proxy}"
+        print(f"trying {route} …")
         try:
             count = strategy(loader, telegram, tracker, accounts)
-            print(f"{route} جواب داد: {count} آیتم تازه.")
+            print(f"{route} worked: {count} new items.")
             return count
         except SessionDead:
             raise
         except RateLimited as exc:
             blocked = exc
-            print(f"{route} نشد: {exc}")
+            print(f"{route} failed: {exc}")
         except Exception as exc:
             blocked = exc
-            print(f"{route} بی‌نتیجه ماند: {exc}")
-    raise RateLimited(blocked or "هیچ روشی کار نکرد")
+            print(f"{route} gave nothing: {exc}")
+    raise RateLimited(blocked or "no route worked")
 
 
 def main():
     missing = [k for k in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID") if not os.environ.get(k)]
     if missing:
-        sys.exit(f"متغیرهای زیر تنظیم نشده‌اند: {', '.join(missing)}")
+        sys.exit(f"These variables are not set: {', '.join(missing)}")
     set_run_deadline()
     config = load_config(os.environ.get("CONFIG", "config.yaml"))
     state = load_state("state.json")
@@ -792,30 +806,33 @@ def main():
             delivered += try_strategy(strategies[name], client, telegram, tracker, config["accounts"], routes)
             worked.append(name)
         except SessionDead as exc:
-            print(f"نشست اینستاگرام از کار افتاده: {exc}")
+            print(f"the Instagram session is dead: {exc}")
             telegram.notify(
-                "⛔ اینستاگرام نشست را به بررسی کشیده؛ پروکسی فایده‌ای ندارد. "
-                "یک نشست تازه بساز و IG_SESSION_B64 را عوض کن. ربات خودکار خاموش شد.\n"
-                f"دلیل: {exc}"
+                "⛔ Instagram put the session behind a human check. No proxy fixes this: "
+                "solve instagram.com/challenge/ in a browser, then build a new session and "
+                "replace IG_SESSION_B64. The bot switched itself off so the account stops "
+                "taking the risk.\n"
+                f"Reason: {exc}"
             )
             disable_workflow()
             tracker.save()
             sys.exit(1)
         except RateLimited as exc:
-            print(f"روش {name} به جایی نرسید: {exc}")
+            print(f"method {name} got nowhere: {exc}")
             failures.append(f"{name}: {exc}")
 
     tracker.save()
     if not worked:
         telegram.notify(
-            "⛔ هیچ‌کدام از راه‌ها جواب نداد و workflow خودکار خاموش می‌شود تا اکانت زیر فشار نماند. "
-            "برای روشن کردن دوباره به Actions برو.\n" + "\n".join(failures)
+            "⛔ No route answered, so the workflow is switching itself off rather than "
+            "keeping the account under pressure. Re-enable it from the Actions tab when "
+            "you want another try.\n" + "\n".join(failures)
         )
         disable_workflow()
     else:
-        print(f"جدید: {delivered} آیتم فرستاده شد با روش {' + '.join(worked)}")
+        print(f"done: {delivered} items sent using {' + '.join(worked)}")
         if delivered:
-            telegram.notify(f"✅ {delivered} آیتم تازه از اینستاگرام ارسال شد.")
+            telegram.notify(f"✅ {delivered} new items sent from Instagram.")
 
 
 if __name__ == "__main__":

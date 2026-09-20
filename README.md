@@ -8,6 +8,31 @@ Telegram bot as real files. Runs on the free GitHub Actions schedule — no serv
 > "The Instagram checkpoint" below), and no technical trick opens it. To bring it back: clear the
 > challenge in a browser → rebuild `IG_SESSION_B64` → enable the workflow.
 
+## Warnings
+
+- **Unofficial access.** The bot talks to Instagram through the private API the official mobile app
+  uses (`i.instagram.com`, with the app's `X-IG-App-ID` and user agent). That is not a public,
+  permitted interface. It breaches Instagram's Terms of Service and can get the reader account
+  rate-limited, checkpointed, disabled or banned. You carry that risk, not this repo.
+- **A session is a password.** `IG_SESSION_B64`, `cookies.txt` and `instagram.session` are live logins
+  — whoever holds one *is* that account, with no second factor to stop them. Never paste them into an
+  issue, a log, a chat or a commit. If one leaks, log out everywhere in Instagram, change the password,
+  and build a new session. Revoke a leaked Telegram token in BotFather the same way.
+- **Poll the minimum, not more.** Runs are the pressure on the account: keep the schedule at 2 hours or
+  slower, keep `MAX_NEW_PER_RUN` small, and never fire several `workflow_dispatch` runs back to back to
+  watch something happen — that alone has burned two sessions here.
+- **Delete the secrets when you stop.** This repo is public. Even though nothing secret is committed,
+  the four Actions secrets (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `IG_USER`, `IG_SESSION_B64`) still
+  sit in it while it is archived. Remove them under Settings → Secrets and variables → Actions, and
+  delete the ignored local files (`cookies.txt`, `instagram.session`, `.token.tmp`) once you are done.
+- **Only your own or authorized content.** Private targets require the reader account to follow them,
+  and that is the only permission check here. Downloading and redistributing other people's media can
+  be a copyright problem independently of Instagram's rules — settle that yourself.
+- **The measurements are dated.** Everything in "Which routes actually work" was measured from a GitHub
+  runner in September 2026. Instagram changes endpoints and thresholds without notice, so those tables
+  are history, not a promise about today.
+- **No warranty.** Provided as a record of what was tried and what answered. Use it at your own risk.
+
 ## Files
 
 - `bot.py` — the core: fetch new posts and stories, download them, upload to Telegram.

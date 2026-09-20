@@ -1,29 +1,44 @@
-# هر پیجی که می‌خواهی دنبال کنی، بدون @ بنویس.
+# Instagram → Telegram poller configuration.
+#
+# WARNING — read before you run this.
+# The bot reads Instagram through the private API the official mobile app uses, which is
+# not a public, permitted interface. It breaches Instagram's Terms of Service, and the
+# account behind IG_SESSION_B64 can be rate-limited, checkpointed or banned for it. Use a
+# throwaway or an account you own; never someone else's session. There is no warranty.
+# See the "Warnings" section of README.md for the details.
+
+# Every page you want to follow, written without @.
 accounts:
   - wwe
   - natgeo
 
-# api = فیدِ خودِ اکانت خواننده از API خصوصی اینستاگرام + استوری‌ها. تنها روشی که از سرور گیت‌هاب جواب می‌دهد.
-# profile = روش قدیمی با instaloader (تایم‌لاین تک‌تک پیج‌ها). از سرور گیت‌هاب با ۴۲۹ رد می‌شود، فقط پشتیبان است.
-# feed = instaloader از فید. فعلاً خالی برمی‌گردد.
-# auto = اول api، اگر نشد profile
+# api = the reading account's own feed from Instagram's private API, plus stories.
+#       The only route that answers from a GitHub server. The reading account must
+#       already follow every page above, because that is all the feed contains.
+# profile = the old instaloader route (each timeline one by one). Rejected with 429
+#           from GitHub servers; kept only as a fallback.
+# feed = instaloader through the feed. Currently returns nothing useful.
+# auto = try api first, then profile.
 mode: auto
 
-# در روش api استوری‌ها هم می‌آیند. false فقط روی روش profile اثر دارد.
+# In api mode stories arrive as well. false only affects profile mode.
 stories: true
 
-# فیدِ اینستاگرام ترتیب زمانی ندارد و پست ماه‌های قبل را هم نشان می‌دهد.
-# هر چه قدیمی‌تر از این ساعت باشد رد می‌شود تا تاریخچه‌ی قدیمی وارد تلگرام نیاید.
+# Instagram's feed is ranked, not chronological, and it serves months-old posts too.
+# Anything older than this many hours is skipped, so the first run does not flood
+# Telegram with the page's back catalogue.
 max_post_age_hours: 24
 
-# استوری یک روز زنده می‌ماند و ربات هر ۲ ساعت کل آن روز را می‌بیند، پس بدون این
-# سقف، استوری‌های ۲۰ ساعته هم پشت سر هم فرستاده می‌شوند.
+# A story lives for a day and the bot sees that whole day on every run, so without
+# these two limits a busy page would send twenty-hour-old stories in bulk.
 max_story_age_hours: 4
 max_stories_per_run: 6
 
-# پروکسی رایگان در تست واقعی نجات نداد (۸ آدرس، همه مرده یا ۴۲۹). روی false بگذار مگر دلیل داشته باشی.
+# Free proxies saved nothing in real testing (8 addresses: dead or the same 429),
+# because Instagram identifies you by the session cookie, not only the IP.
+# Leave this false unless you have a reason.
 proxies: false
 
-# اگر proxies را true گذاشتی، لیست‌های جایگزین را این‌جا بنویس.
+# If you set proxies to true, list your own proxy sources here.
 # proxy_urls:
 #   - https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/protocols/http/data.txt
