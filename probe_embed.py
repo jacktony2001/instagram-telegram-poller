@@ -1,12 +1,16 @@
-"""Throwaway probe: do Instagram's own anonymous embed endpoints still answer from GitHub's IP?
+"""Throwaway probe, second pass: how much can Instagram hand out with no cookie at all?
 
-Every third-party mirror sits behind Cloudflare and refuses the runner (403), and RSS-Bridge's public
-instance returns 500 for them. Instagram's embed/oEmbed paths are different: they are built to render
-inside other people's pages without a login, so they are not supposed to need a session, and they are
-served by instagram.com itself rather than a mirror. If the post embed carries media URLs, the bot can
-run on shortcodes alone with no cookie and no checkpoint to lose.
+The first pass proved oEmbed answers 200 with a real scontent CDN URL while every other path either
+needs the challenged session or is 429. That matters: it means GitHub's IP is not banned outright, it
+just is not allowed to read feeds. Two questions are still open and they decide whether a
+session-free route exists:
 
-Delete this file together with the mirrors workflow once a source is chosen.
+1. Does oEmbed carry enough to deliver a post (caption, every carousel slide, the video file), or only
+   a thumbnail?
+2. Is there any anonymous way to learn which shortcodes are new — robots.txt/sitemaps are built for
+   crawlers and usually sit in the same loose protection class as oEmbed.
+
+Delete this file with the mirrors workflow once a source is chosen.
 """
 
 import re
@@ -23,44 +27,40 @@ HEADERS = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html, application/json, */*;q=0.5",
+    "Accept": "text/html, application/xml, application/json, */*;q=0.5",
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# Real shortcodes taken from state.json, so the probes point at posts that exist.
 POST = "DdecWXJDhPS"
-STORY = "DdcVNQehPMP"
+NATGEO = "DdcjXAeFyr8"
 
 SOURCES = [
-    ("پست · صفحه HTML", f"https://www.instagram.com/p/{POST}/"),
-    ("پست · embed", f"https://www.instagram.com/p/{POST}/embed/"),
-    ("پست · embed captioned", f"https://www.instagram.com/p/{POST}/embed/captioned/"),
-    ("پست · oEmbed API", f"https://www.instagram.com/api/v1/oembed/?url=https://www.instagram.com/p/{POST}/&omniture="),
-    ("پروفایل · embed", "https://www.instagram.com/wwe/embed/"),
-    ("پروفایل · embed با scrolly", "https://www.instagram.com/wwe/embed/captioned/"),
-    ("استوری · embed", f"https://www.instagram.com/p/{STORY}/embed/"),
-    ("جست‌وجوی بدون لاگین", "https://www.instagram.com/web/search/topsearch/?query=wwe"),
+    ("oEmbed · کامل", f"https://www.instagram.com/api/v1/oembed/?url=https://www.instagram.com/p/{POST}/"),
+    ("oEmbed · بی‌پارامتر اضافه", f"https://www.instagram.com/api/v1/oembed/?url=https://www.instagram.com/p/{NATGEO}/&omniture="),
+    ("oEmbed · با maxwidth", f"https://www.instagram.com/api/v1/oembed/?url=https://www.instagram.com/p/{POST}/&max_width=1080&omit_script=true"),
+    ("oEmbed · پروفایل", "https://www.instagram.com/api/v1/oembed/?url=https://www.instagram.com/wwe/"),
+    ("dis · خودِ پست", f"https://www.instagram.com/p/{POST}/?__a=1&__d=dis"),
+    ("dis · reel", f"https://www.instagram.com/reel/{POST}/?__a=1&__d=dis"),
+    ("robots.txt", "https://www.instagram.com/robots.txt"),
+    ("sitemap index", "https://www.instagram.com/sitemap.xml"),
+    ("sitemap · accounts", "https://www.instagram.com/sitemaps/accounts/sitemap.xml"),
+    ("sitemap · medias", "https://www.instagram.com/sitemaps/medias/sitemap.xml"),
+    ("sitemap · پروفایل", "https://www.instagram.com/wwe/sitemap.xml"),
 ]
 
-# Something is only usable if the response names a real media host or a real post id.
-NEEDLES = ["cdninstagram.com", "scontent", "og:image", "shortcode", "image_versions",
-           "video_versions", "edge_media", "xdt_api", "thumbnail_src", "html"]
 
-
-def judge(resp):
-    body = resp.text
-    found = [n for n in NEEDLES if n in body]
-    print(f"  {resp.status_code} · {len(body)} کاراکتر · server={resp.headers.get('server', '?')} · "
-          f"type={resp.headers.get('content-type', '?')[:40]}")
-    print(f"  نشانه‌ها: {', '.join(found) or '—'}")
-    urls = re.findall(r"https://[^\"'\\ ]+?(?:cdninstagram|scontent)[^\"'\\ ]+", body)[:3]
-    for url in urls:
-        print(f"  مدیا: {url[:150]}")
-    metas = re.findall(r'<meta property="og:(?:image|title|description)" content="([^"]{0,120})', body)[:4]
-    for meta in metas:
-        print(f"  meta: {' '.join(meta.split())}")
-    if not urls and not found:
-        print(f"  نمونه: {' '.join(body[:160].split())}")
+def dump_json(resp):
+    try:
+        data = resp.json()
+    except ValueError:
+        print(f"  JSON نیست · {' '.join(resp.text[:160].split())}")
+        return
+    print(f"  کلیدها: {sorted(data.keys())[:14]}")
+    for key, value in data.items():
+        if isinstance(value, str):
+            print(f"  {key}: {' '.join(value.split())[:200]}")
+        else:
+            print(f"  {key}: {str(value)[:120]}")
 
 
 def main():
@@ -68,7 +68,23 @@ def main():
         print(f"\n{label}\n  {url}")
         try:
             resp = requests.get(url, headers=HEADERS, timeout=30, allow_redirects=True)
-            judge(resp)
+            body = resp.text
+            print(f"  {resp.status_code} · {len(body)} کاراکتر · type={resp.headers.get('content-type', '?')[:40]}")
+            if resp.status_code != 200:
+                print(f"  نمونه: {' '.join(body[:160].split())}")
+            elif "json" in resp.headers.get("content-type", ""):
+                dump_json(resp)
+            elif "xml" in resp.headers.get("content-type", "") or body.lstrip().startswith("<?xml"):
+                locs = re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", body)
+                print(f"  <loc> ها: {len(locs)}")
+                for loc in locs[:8]:
+                    print(f"   {loc[:140]}")
+            else:
+                og = re.findall(r'<meta (?:property|name)="([^"]+)" content="([^"]{0,140})"', body)[:14]
+                for name, content in og:
+                    print(f"  {name}: {' '.join(content.split())}")
+                if not og:
+                    print(f"  نمونه: {' '.join(body[:400].split())}")
         except Exception as exc:
             print(f"  ERR {type(exc).__name__}: {str(exc)[:150]}")
         time.sleep(2)
